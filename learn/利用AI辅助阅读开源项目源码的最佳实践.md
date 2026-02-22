@@ -31,7 +31,7 @@
 ```
 "为什么作者要把 Transport 抽象成协议而不是直接用 URLSessionWebSocketTask？"
 "这里用 enum 而不是多个 delegate 方法，有什么好处？"
-"FrameCollector 和 FrameHandler 为什么要分开？"
+"FrameCollector 和 Framer 为什么要分开？"
 ```
 
 差的问题：
