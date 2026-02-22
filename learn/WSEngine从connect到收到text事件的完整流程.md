@@ -280,25 +280,186 @@ public func add(frame: Frame) {
 
 ## 模块间的 Delegate 链
 
+### 什么是 Delegate 链？
+
+在 Starscream 中，模块之间不直接调用彼此的方法，而是通过 **delegate 协议** 通信。每个模块只知道"我要把事件通知给我的 delegate"，不关心 delegate 具体是谁。WSEngine 作为中枢，把自己注册为多个模块的 delegate，串联起整条链路。
+
+### 完整的链路图
+
 ```
-TCPTransport ──TransportEventClient──▶ WSEngine
-                                          │
-                  ┌───────────────────────┤
-                  │                       │
-                  ▼                       ▼
-          FoundationHTTPHandler      WSFramer
-          ──HTTPHandlerDelegate──▶   ──FramerEventClient──▶ WSEngine
-                WSEngine                                       │
-                                                               ▼
-                                                        FrameCollector
-                                                   ──FrameCollectorDelegate──▶ WSEngine
-                                                                                  │
-                                                                                  ▼
-                                                                      ──EngineDelegate──▶ WebSocket
-                                                                                              │
-                                                                                              ▼
-                                                                                      用户 delegate / onEvent
+┌──────────────┐    TransportEventClient     ┌──────────┐
+│ TCPTransport │ ──────────────────────────▶  │ WSEngine  │
+└──────────────┘  "TCP 有数据来了/连上了"       └────┬─────┘
+                                                   │
+                    ┌──────────────────────────────┤
+                    │ WSEngine 把数据分发给          │
+                    │ 两个下游模块                   │
+                    ▼                              ▼
+          ┌─────────────────────┐        ┌──────────────┐
+          │ FoundationHTTPHandler│        │   WSFramer    │
+          └────────┬────────────┘        └──────┬───────┘
+                   │ HTTPHandlerDelegate         │ FramerEventClient
+                   │ "HTTP 握手成功了"             │ "解析出一个帧了"
+                   ▼                              ▼
+             ┌──────────┐                  ┌──────────┐
+             │ WSEngine  │                 │ WSEngine  │
+             └──────────┘                  └────┬─────┘
+                                                │
+                                                │ WSEngine 把帧交给
+                                                ▼
+                                       ┌────────────────┐
+                                       │ FrameCollector  │
+                                       └───────┬────────┘
+                                               │ FrameCollectorDelegate
+                                               │ "完整消息拼好了"
+                                               ▼
+                                         ┌──────────┐
+                                         │ WSEngine  │
+                                         └────┬─────┘
+                                               │ EngineDelegate
+                                               │ "这是最终事件"
+                                               ▼
+                                         ┌──────────┐
+                                         │ WebSocket │
+                                         └────┬─────┘
+                                               │
+                                               ▼
+                                       用户 delegate / onEvent
 ```
+
+### 逐跳解释
+
+#### 第 1 跳：TCPTransport → WSEngine
+
+- **协议**: `TransportEventClient`
+- **注册时机**: `WSEngine.start()` 中调用 `transport.register(delegate: self)`
+- **回调方法**: `connectionChanged(state:)`
+- **传递的内容**: TCP 连接状态（`.connected`、`.receive(data)`、`.failed` 等）
+
+```swift
+// TCPTransport 内部：连接就绪时
+self?.delegate?.connectionChanged(state: .connected)
+
+// TCPTransport 内部：读到数据时
+s.delegate?.connectionChanged(state: .receive(data))
+```
+
+```swift
+// WSEngine 接收（实现 TransportEventClient）：
+public func connectionChanged(state: ConnectionState) {
+    switch state {
+    case .connected:
+        // 发送 HTTP Upgrade 请求...
+    case .receive(let data):
+        if didUpgrade {
+            framer.add(data: data)        // → 走第 3 跳
+        } else {
+            httpHandler.parse(data: data)  // → 走第 2 跳
+        }
+    }
+}
+```
+
+#### 第 2 跳：FoundationHTTPHandler → WSEngine（仅握手阶段）
+
+- **协议**: `HTTPHandlerDelegate`
+- **注册时机**: `WSEngine.start()` 中调用 `httpHandler.register(delegate: self)`
+- **回调方法**: `didReceiveHTTP(event:)`
+- **传递的内容**: HTTP 握手结果（`.success(headers)` 或 `.failure(error)`）
+
+```swift
+// FoundationHTTPHandler 内部：解析到 101 响应
+delegate?.didReceiveHTTP(event: .success(headers))
+```
+
+```swift
+// WSEngine 接收（实现 HTTPHandlerDelegate）：
+public func didReceiveHTTP(event: HTTPEvent) {
+    case .success(let headers):
+        didUpgrade = true   // 从此数据走 Framer 而不再走 HTTPHandler
+        canSend = true
+        broadcast(event: .connected(headers))  // → 通知 WebSocket
+}
+```
+
+> 握手完成后，这条链路就不再使用了。后续数据直接走第 3 跳。
+
+#### 第 3 跳：WSFramer → WSEngine（数据阶段）
+
+- **协议**: `FramerEventClient`
+- **注册时机**: `WSEngine.start()` 中调用 `framer.register(delegate: self)`
+- **回调方法**: `frameProcessed(event:)`
+- **传递的内容**: 解析后的帧（`.frame(Frame)`）或错误
+
+```swift
+// WSFramer 内部：成功解析出一个帧
+s.delegate?.frameProcessed(event: .frame(frame))
+```
+
+```swift
+// WSEngine 接收（实现 FramerEventClient）：
+public func frameProcessed(event: FrameEvent) {
+    case .frame(let frame):
+        frameHandler.add(frame: frame)  // → 走第 4 跳
+}
+```
+
+#### 第 4 跳：FrameCollector → WSEngine
+
+- **协议**: `FrameCollectorDelegate`
+- **注册时机**: `WSEngine.init()` 中 `frameHandler.delegate = self`
+- **回调方法**: `didForm(event:)`
+- **传递的内容**: 组装后的完整消息（`.text(String)`、`.binary(Data)` 等）
+
+```swift
+// FrameCollector 内部：分片收齐，拼出完整消息
+delegate?.didForm(event: .text(string))
+```
+
+```swift
+// WSEngine 接收（实现 FrameCollectorDelegate）：
+public func didForm(event: FrameCollector.Event) {
+    case .text(let string):
+        broadcast(event: .text(string))  // → 走第 5 跳
+}
+```
+
+#### 第 5 跳：WSEngine → WebSocket → 用户
+
+- **协议**: `EngineDelegate`
+- **注册时机**: `WebSocket.connect()` 中调用 `engine.register(delegate: self)`
+- **回调方法**: `didReceive(event:)`
+- **传递的内容**: 最终的 `WebSocketEvent`（`.text`、`.binary`、`.connected` 等）
+
+```swift
+// WSEngine 内部的 broadcast 方法：
+private func broadcast(event: WebSocketEvent) {
+    delegate?.didReceive(event: event)
+}
+```
+
+```swift
+// WebSocket 接收（实现 EngineDelegate），再转发给用户：
+public func didReceive(event: WebSocketEvent) {
+    callbackQueue.async {
+        self.delegate?.didReceive(event: event, client: self)  // 用户的 delegate
+        self.onEvent?(event)                                    // 用户的闭包
+    }
+}
+```
+
+### 为什么 WSEngine 出现了这么多次？
+
+注意到 WSEngine 在图中反复出现——它**同时是 4 个模块的 delegate**：
+
+| 谁通知 WSEngine | 通过什么协议 | WSEngine 的回调方法 |
+|----------------|------------|-------------------|
+| TCPTransport | `TransportEventClient` | `connectionChanged(state:)` |
+| FoundationHTTPHandler | `HTTPHandlerDelegate` | `didReceiveHTTP(event:)` |
+| WSFramer | `FramerEventClient` | `frameProcessed(event:)` |
+| FrameCollector | `FrameCollectorDelegate` | `didForm(event:)` |
+
+这正是 WSEngine 作为"中枢调度器"的设计意图：所有事件都汇聚到 WSEngine，由它决定下一步交给谁处理，最终通过 `EngineDelegate` 把结果传给 WebSocket。
 
 ---
 
