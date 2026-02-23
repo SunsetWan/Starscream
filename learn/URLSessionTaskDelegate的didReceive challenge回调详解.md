@@ -812,3 +812,58 @@ SSL Pinning 额外验证：
 | 公钥锁定（Public Key Pinning） | ❌ 不能 | App 内预埋的公钥无法被篡改 |
 
 这也解释了为什么 Alamofire 提供 `PinnedCertificatesTrustEvaluator` 和 `PublicKeysTrustEvaluator`——它们正是为了防止这种"合法中间人"攻击。而 Starscream 需要用户自己实现 `CertificatePinning` 协议来达到同样的效果。
+
+#### SSL Pinning 的两种方式：证书锁定 vs 公钥锁定
+
+在移动端实践中，SSL Pinning 主要就是**两种方式**：
+
+**① 证书锁定（Certificate Pinning）—— 锁定整个证书**
+
+把服务器证书文件（`.cer` / `.der`）打包进 App，连接时比对服务器返回的证书与预埋证书的**完整二进制数据**是否一致。
+
+```swift
+// Alamofire 实现：PinnedCertificatesTrustEvaluator
+let serverCertificatesData = Set(trust.af.certificateData)   // 服务器证书的完整 Data
+let pinnedCertificatesData = Set(certificates.af.data)        // App 预埋证书的完整 Data
+let match = !serverCertificatesData.isDisjoint(with: pinnedCertificatesData)  // 取交集
+```
+
+**② 公钥锁定（Public Key Pinning）—— 只锁定证书中的公钥**
+
+从预埋证书中提取公钥，连接时只比对服务器证书中的**公钥**是否与预埋公钥一致，忽略证书的其他字段（有效期、颁发者等）。
+
+```swift
+// Alamofire 实现：PublicKeysTrustEvaluator
+for serverPublicKey in trust.af.publicKeys {    // 服务器证书链中的公钥
+    if keys.contains(serverPublicKey) {          // App 预埋的公钥
+        return true
+    }
+}
+```
+
+**两种方式的对比：**
+
+| 维度 | 证书锁定 (Certificate Pinning) | 公钥锁定 (Public Key Pinning) |
+|------|------|------|
+| **比对内容** | 整个证书（公钥 + 域名 + 有效期 + CA 签名 + …） | 仅证书中的公钥 |
+| **安全性** | ⭐⭐⭐ 更严格——证书任何字段变化都会被检测到 | ⭐⭐⭐ 同样安全——攻击者无法伪造匹配的公钥 |
+| **证书续期** | ❌ **必须发版更新 App**——新证书的有效期、签名等字段会变，比对失败 | ✅ **无需更新 App**——续期时可以保持同一对密钥，公钥不变 |
+| **更换密钥** | ❌ 必须发版 | ❌ 必须发版（两种方式在更换密钥时都需要更新） |
+| **实现复杂度** | 简单——直接比对证书文件的二进制数据 | 稍复杂——需要从证书中提取公钥再比对 |
+| **Alamofire** | `PinnedCertificatesTrustEvaluator` | `PublicKeysTrustEvaluator` |
+| **Starscream** | 需自己实现 `CertificatePinning` 协议 | 需自己实现 `CertificatePinning` 协议 |
+
+**实际选择建议：**
+
+```
+                         证书会定期续期吗？
+                              │
+                    ┌─────────┴─────────┐
+                    │ 是                 │ 否（或很少）
+                    ▼                    ▼
+            公钥锁定更合适            两种都可以
+        （续期时保持同一密钥对，       （证书锁定更简单直接）
+         无需发版更新 App）
+```
+
+> **为什么公钥锁定在证书续期时不受影响？** 因为证书续期时可以用**同一对密钥**生成新证书——新证书的有效期、CA 签名等字段会变，但公钥不变。证书锁定比对的是整个证书（所有字段），所以会失败；公钥锁定只比对公钥，所以不受影响。
