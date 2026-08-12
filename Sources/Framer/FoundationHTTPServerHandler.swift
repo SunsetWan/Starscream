@@ -23,77 +23,87 @@
 import Foundation
 
 public class FoundationHTTPServerHandler: HTTPServerHandler {
-    var buffer = Data()
+    private var accumulator = HTTPRequestAccumulator()
+    private var pendingRequest: WebSocketHandshake.ServerRequest?
     weak var delegate: HTTPServerDelegate?
-    let getVerb: NSString = "GET"
     
     public func register(delegate: HTTPServerDelegate) {
         self.delegate = delegate
     }
     
     public func createResponse(headers: [String: String]) -> Data {
-        #if os(watchOS)
-        //TODO: build response header
-        return Data()
-        #else
-        let response = CFHTTPMessageCreateResponse(kCFAllocatorDefault, HTTPWSHeader.switchProtocolCode,
-                                                   nil, kCFHTTPVersion1_1).takeRetainedValue()
-        
-        //TODO: add other values to make a proper response here...
-        //TODO: also sec key thing (Sec-WebSocket-Key)
-        for (key, value) in headers {
-            CFHTTPMessageSetHeaderFieldValue(response, key as CFString, value as CFString)
-        }
-        guard let cfData = CFHTTPMessageCopySerializedMessage(response)?.takeRetainedValue() else {
+        guard let pendingRequest else { return Data() }
+        do {
+            let selectedProtocol = WebSocketHandshake.header(named: HTTPWSHeader.protocolName, in: headers)
+            let selectedExtensions = WebSocketHandshake.header(named: HTTPWSHeader.extensionName, in: headers).map { [$0] } ?? []
+            var responseHeaders = try WebSocketHandshake.serverResponseHeaders(
+                for: pendingRequest,
+                selectedProtocol: selectedProtocol,
+                selectedExtensions: selectedExtensions
+            )
+
+            let reservedNames = [
+                HTTPWSHeader.upgradeName,
+                HTTPWSHeader.connectionName,
+                HTTPWSHeader.acceptName,
+                HTTPWSHeader.protocolName,
+                HTTPWSHeader.extensionName,
+            ]
+            for (name, value) in headers where !reservedNames.contains(where: {
+                $0.caseInsensitiveCompare(name) == .orderedSame
+            }) {
+                guard WebSocketHandshake.isValidHTTPHeader(name: name, value: value) else {
+                    return Data()
+                }
+                responseHeaders[name] = value
+            }
+
+            let preferredOrder = [
+                HTTPWSHeader.upgradeName,
+                HTTPWSHeader.connectionName,
+                HTTPWSHeader.acceptName,
+                HTTPWSHeader.protocolName,
+                HTTPWSHeader.extensionName,
+            ]
+            var message = "HTTP/1.1 101 Switching Protocols\r\n"
+            for name in preferredOrder {
+                if let value = responseHeaders.removeValue(forKey: name) {
+                    message += "\(name): \(value)\r\n"
+                }
+            }
+            for name in responseHeaders.keys.sorted() {
+                if let value = responseHeaders[name] {
+                    message += "\(name): \(value)\r\n"
+                }
+            }
+            message += "\r\n"
+            return Data(message.utf8)
+        } catch {
             return Data()
         }
-        return cfData as Data
-        #endif
     }
     
     public func parse(data: Data) {
-        buffer.append(data)
-        if parseContent(data: buffer) {
-            buffer = Data()
-        }
-    }
-    
-    //returns true when the buffer should be cleared
-    func parseContent(data: Data) -> Bool {
-        var pointer = [UInt8]()
-        data.withUnsafeBytes { pointer.append(contentsOf: $0) }
-        #if os(watchOS)
-        //TODO: parse data
-        return false
-        #else
-        let response = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, true).takeRetainedValue()
-        if !CFHTTPMessageAppendBytes(response, pointer, data.count) {
-            return false //not enough data, wait for more
-        }
-        if !CFHTTPMessageIsHeaderComplete(response) {
-            return false //not enough data, wait for more
-        }
-        if let method = CFHTTPMessageCopyRequestMethod(response)?.takeRetainedValue() {
-            if (method as NSString) != getVerb {
-                delegate?.didReceive(event: .failure(HTTPUpgradeError.invalidData))
-                return true
+        do {
+            guard let request = try accumulator.append(data) else { return }
+            pendingRequest = nil
+            do {
+                pendingRequest = try WebSocketHandshake.validateServerRequest(
+                    method: request.method,
+                    httpVersion: request.version,
+                    headers: request.headers
+                )
+            } catch let error as WebSocketHandshake.ValidationError {
+                delegate?.didReceive(event: .failure(HTTPUpgradeError.invalidHandshake(error)))
+                return
             }
+            delegate?.didReceive(event: .success(headers: request.headers, leftover: request.leftover))
+        } catch HTTPHeadParsingError.headerTooLarge {
+            accumulator = HTTPRequestAccumulator()
+            delegate?.didReceive(event: .failure(HTTPUpgradeError.headerTooLarge))
+        } catch {
+            accumulator = HTTPRequestAccumulator()
+            delegate?.didReceive(event: .failure(HTTPUpgradeError.invalidData))
         }
-        
-        if let cfHeaders = CFHTTPMessageCopyAllHeaderFields(response) {
-            let nsHeaders = cfHeaders.takeRetainedValue() as NSDictionary
-            var headers = [String: String]()
-            for (key, value) in nsHeaders {
-                if let key = key as? String, let value = value as? String {
-                    headers[key] = value
-                }
-            }
-            delegate?.didReceive(event: .success(headers))
-            return true
-        }
-        
-        delegate?.didReceive(event: .failure(HTTPUpgradeError.invalidData))
-        return true
-        #endif
     }
 }

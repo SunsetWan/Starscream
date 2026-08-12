@@ -1,4 +1,4 @@
-// swift-tools-version:5.3
+// swift-tools-version: 6.0
 
 //
 //  Package.Swift
@@ -23,16 +23,34 @@
 import PackageDescription
 
 let package = Package(
-        name: "Starscream",
-        products: [
-            .library(name: "Starscream", targets: ["Starscream"])
-        ],
-        dependencies: [],
-        targets: [
-            .target(name: "Starscream",
-                    path: "Sources",
-                    resources: [.copy("PrivacyInfo.xcprivacy")])
-        ]
+    name: "Starscream",
+    platforms: [
+        .iOS(.v15),
+        .macOS(.v10_15),
+        .tvOS(.v13),
+        .watchOS(.v6),
+    ],
+    products: [
+        .library(name: "Starscream", targets: ["Starscream"]),
+    ],
+    dependencies: [],
+    targets: [
+        .target(
+            name: "Starscream",
+            path: "Sources",
+            exclude: ["Info.plist"],
+            resources: [.copy("PrivacyInfo.xcprivacy")],
+            swiftSettings: [.enableUpcomingFeature("StrictConcurrency")]
+        ),
+        .testTarget(
+            name: "StarscreamTests",
+            dependencies: ["Starscream"],
+            path: "Tests",
+            exclude: ["Info.plist"],
+            swiftSettings: [.enableUpcomingFeature("StrictConcurrency")]
+        ),
+    ],
+    swiftLanguageModes: [.v6]
 )
 
 #if os(Linux)

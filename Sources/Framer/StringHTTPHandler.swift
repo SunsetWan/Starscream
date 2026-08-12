@@ -23,8 +23,7 @@
 import Foundation
 
 public class StringHTTPHandler: HTTPHandler {
-    
-    var buffer = Data()
+    private var accumulator = HTTPResponseAccumulator()
     weak var delegate: HTTPHandlerDelegate?
     
     public init() {
@@ -36,16 +35,13 @@ public class StringHTTPHandler: HTTPHandler {
             return Data()
         }
         
-        var path = url.absoluteString
-        let offset = (url.scheme?.count ?? 2) + 3
-        path = String(path[path.index(path.startIndex, offsetBy: offset)..<path.endIndex])
-        if let range = path.range(of: "/") {
-            path = String(path[range.lowerBound..<path.endIndex])
-        } else {
+        let components = URLComponents(url: url, resolvingAgainstBaseURL: false)
+        var path = components?.percentEncodedPath ?? url.path
+        if path.isEmpty {
             path = "/"
-            if let query = url.query {
-                path += "?" + query
-            }
+        }
+        if let query = components?.percentEncodedQuery {
+            path += "?" + query
         }
         
         var httpBody = "\(request.httpMethod ?? "GET") \(path) HTTP/1.1\r\n"
@@ -68,76 +64,38 @@ public class StringHTTPHandler: HTTPHandler {
     }
     
     public func parse(data: Data) -> Int {
-        let offset = findEndOfHTTP(data: data)
-        if offset > 0 {
-            buffer.append(data.subdata(in: 0..<offset))
-            if parseContent(data: buffer) {
-                buffer = Data()
+        do {
+            guard let response = try accumulator.append(data) else { return -1 }
+            guard response.statusCode == HTTPWSHeader.switchProtocolCode else {
+                delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.notAnUpgrade(response.statusCode, response.headers)))
+                return response.consumedFromChunk
             }
-        } else {
-            buffer.append(data)
-        }
-        return offset
-    }
-    
-    //returns true when the buffer should be cleared
-    func parseContent(data: Data) -> Bool {
-        guard let str = String(data: data, encoding: .utf8) else {
+            do {
+                try WebSocketHandshake.validateSwitchingProtocolsResponse(
+                    statusCode: response.statusCode,
+                    headers: response.headers
+                )
+            } catch let error as WebSocketHandshake.ValidationError {
+                delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidHandshake(error)))
+                return response.consumedFromChunk
+            }
+            delegate?.didReceiveHTTP(event: .success(headers: response.headers, leftover: response.leftover))
+            return response.consumedFromChunk
+        } catch HTTPHeadParsingError.headerTooLarge {
+            accumulator = HTTPResponseAccumulator()
+            delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.headerTooLarge))
+        } catch {
+            accumulator = HTTPResponseAccumulator()
             delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidData))
-            return true
         }
-        let splitArr = str.components(separatedBy: "\r\n")
-        var code = -1
-        var i = 0
-        var headers = [String: String]()
-        for str in splitArr {
-            if i == 0 {
-                let responseSplit = str.components(separatedBy: .whitespaces)
-                guard responseSplit.count > 1 else {
-                    delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidData))
-                    return true
-                }
-                if let c = Int(responseSplit[1]) {
-                    code = c
-                }
-            } else {
-                guard let separatorIndex = str.firstIndex(of: ":") else { break }
-                let key = str.prefix(upTo: separatorIndex).trimmingCharacters(in: .whitespaces)
-                let val = str.suffix(from: str.index(after: separatorIndex)).trimmingCharacters(in: .whitespaces)
-                headers[key.lowercased()] = val
-            }
-            i += 1
-        }
-        
-        if code != HTTPWSHeader.switchProtocolCode {
-            delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.notAnUpgrade(code, headers)))
-            return true
-        }
-        
-        delegate?.didReceiveHTTP(event: .success(headers))
-        return true
+        return -1
     }
     
     public func register(delegate: HTTPHandlerDelegate) {
         self.delegate = delegate
     }
-    
-    private func findEndOfHTTP(data: Data) -> Int {
-        let endBytes = [UInt8(ascii: "\r"), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\n")]
-        var pointer = [UInt8]()
-        data.withUnsafeBytes { pointer.append(contentsOf: $0) }
-        var k = 0
-        for i in 0..<data.count {
-            if pointer[i] == endBytes[k] {
-                k += 1
-                if k == 4 {
-                    return i + 1
-                }
-            } else {
-                k = 0
-            }
-        }
-        return -1
+
+    public func reset() {
+        accumulator = HTTPResponseAccumulator()
     }
 }
-

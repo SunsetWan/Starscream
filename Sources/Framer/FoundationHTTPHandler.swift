@@ -25,8 +25,7 @@ import Foundation
 public typealias FoundationHTTPHandler = StringHTTPHandler
 #else
 public class FoundationHTTPHandler: HTTPHandler {
-
-    var buffer = Data()
+    private var accumulator = HTTPResponseAccumulator()
     weak var delegate: HTTPHandlerDelegate?
     
     public init() {
@@ -34,8 +33,13 @@ public class FoundationHTTPHandler: HTTPHandler {
     }
     
     public func convert(request: URLRequest) -> Data {
-        let msg = CFHTTPMessageCreateRequest(kCFAllocatorDefault, request.httpMethod! as CFString,
-                                             request.url! as CFURL, kCFHTTPVersion1_1).takeRetainedValue()
+        guard let url = request.url else { return Data() }
+        let msg = CFHTTPMessageCreateRequest(
+            kCFAllocatorDefault,
+            (request.httpMethod ?? "GET") as CFString,
+            url as CFURL,
+            kCFHTTPVersion1_1
+        ).takeRetainedValue()
         if let headers = request.allHTTPHeaderFields {
             for (aKey, aValue) in headers {
                 CFHTTPMessageSetHeaderFieldValue(msg, aKey as CFString, aValue as CFString)
@@ -51,74 +55,39 @@ public class FoundationHTTPHandler: HTTPHandler {
     }
     
     public func parse(data: Data) -> Int {
-        let offset = findEndOfHTTP(data: data)
-        if offset > 0 {
-            buffer.append(data.subdata(in: 0..<offset))
-        } else {
-            buffer.append(data)
-        }
-        if parseContent(data: buffer) {
-            buffer = Data()
-        }
-        return offset
-    }
-    
-    //returns true when the buffer should be cleared
-    func parseContent(data: Data) -> Bool {
-        var pointer = [UInt8]()
-        data.withUnsafeBytes { pointer.append(contentsOf: $0) }
-
-        let response = CFHTTPMessageCreateEmpty(kCFAllocatorDefault, false).takeRetainedValue()
-        if !CFHTTPMessageAppendBytes(response, pointer, data.count) {
-            return false //not enough data, wait for more
-        }
-        if !CFHTTPMessageIsHeaderComplete(response) {
-            return false //not enough data, wait for more
-        }
-        
-        if let cfHeaders = CFHTTPMessageCopyAllHeaderFields(response) {
-            let nsHeaders = cfHeaders.takeRetainedValue() as NSDictionary
-            var headers = [String: String]()
-            for (key, value) in nsHeaders {
-                if let key = key as? String, let value = value as? String {
-                    headers[key] = value
-                }
+        do {
+            guard let response = try accumulator.append(data) else { return -1 }
+            guard response.statusCode == HTTPWSHeader.switchProtocolCode else {
+                delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.notAnUpgrade(response.statusCode, response.headers)))
+                return response.consumedFromChunk
             }
-            
-            let code = CFHTTPMessageGetResponseStatusCode(response)
-            if code != HTTPWSHeader.switchProtocolCode {
-                delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.notAnUpgrade(code, headers)))
-                return true
+            do {
+                try WebSocketHandshake.validateSwitchingProtocolsResponse(
+                    statusCode: response.statusCode,
+                    headers: response.headers
+                )
+            } catch let error as WebSocketHandshake.ValidationError {
+                delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidHandshake(error)))
+                return response.consumedFromChunk
             }
-            
-            delegate?.didReceiveHTTP(event: .success(headers))
-            return true
+            delegate?.didReceiveHTTP(event: .success(headers: response.headers, leftover: response.leftover))
+            return response.consumedFromChunk
+        } catch HTTPHeadParsingError.headerTooLarge {
+            accumulator = HTTPResponseAccumulator()
+            delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.headerTooLarge))
+        } catch {
+            accumulator = HTTPResponseAccumulator()
+            delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidData))
         }
-        
-        delegate?.didReceiveHTTP(event: .failure(HTTPUpgradeError.invalidData))
-        return true
+        return -1
     }
     
     public func register(delegate: HTTPHandlerDelegate) {
         self.delegate = delegate
     }
-    
-    private func findEndOfHTTP(data: Data) -> Int {
-        let endBytes = [UInt8(ascii: "\r"), UInt8(ascii: "\n"), UInt8(ascii: "\r"), UInt8(ascii: "\n")]
-        var pointer = [UInt8]()
-        data.withUnsafeBytes { pointer.append(contentsOf: $0) }
-        var k = 0
-        for i in 0..<data.count {
-            if pointer[i] == endBytes[k] {
-                k += 1
-                if k == 4 {
-                    return i + 1
-                }
-            } else {
-                k = 0
-            }
-        }
-        return -1
+
+    public func reset() {
+        accumulator = HTTPResponseAccumulator()
     }
 }
 #endif

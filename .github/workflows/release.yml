@@ -10,13 +10,15 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
-      - name: Set Latest Tag
+      - name: Set release tag
         id: vars
-        run: echo "tag=$(git describe --tags `git rev-list --tags --max-count=1`)" >> $GITHUB_OUTPUT
+        run: echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
       - uses: ruby/setup-ruby@v1
         with:
           bundler-cache: true # runs 'bundle install' and caches installed gems automatically
       - run: bundle exec fastlane test
+        env:
+          CI: true
       - run: bundle exec fastlane release
         env:
           GITHUB_TOKEN: ${{ secrets.BOT_GITHUB_TOKEN }}

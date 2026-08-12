@@ -22,147 +22,176 @@
 
 import Foundation
 
-public enum FoundationTransportError: Error {
+public enum FoundationTransportError: Error, Sendable {
     case invalidRequest
     case invalidOutputStream
+    case missingPeerTrust
     case timeout
 }
 
-public class FoundationTransport: NSObject, Transport, StreamDelegate {
-    private weak var delegate: TransportEventClient?
+public class FoundationTransport: NSObject, Transport, StreamDelegate, @unchecked Sendable {
+    private struct State {
+        var delegate = WeakReference<any TransportEventClient>()
+        var inputStream: InputStream?
+        var outputStream: OutputStream?
+        var isOpen = false
+        var isTLS = false
+        var domain: String?
+        var certPinner: (any CertificatePinning)?
+        var generation: UInt64 = 0
+        var hasStartedOpenValidation = false
+        var hasFinishedOpenValidation = false
+    }
+
+    /// Safety invariant: stream lifecycle operations and delegate delivery are serialized by
+    /// `lifecycleLock`; delayed work must match the current generation before it can act.
+    private let state = Locked(State())
+    private let lifecycleLock = NSRecursiveLock()
     private let workQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
-    private var inputStream: InputStream?
-    private var outputStream: OutputStream?
-    private var isOpen = false
-    private var onConnect: ((InputStream, OutputStream) -> Void)?
-    private var isTLS = false
-    private var certPinner: CertificatePinning?
+    private let onConnect: (@Sendable (InputStream, OutputStream) -> Void)?
     
     public var usingTLS: Bool {
-        return self.isTLS
+        state.withLock { $0.isTLS }
     }
     
-    public init(streamConfiguration: ((InputStream, OutputStream) -> Void)? = nil) {
-        super.init()
+    public init(streamConfiguration: (@Sendable (InputStream, OutputStream) -> Void)? = nil) {
         onConnect = streamConfiguration
+        super.init()
     }
     
     deinit {
-        inputStream?.delegate = nil
-        outputStream?.delegate = nil
+        disconnect()
     }
     
     public func connect(url: URL, timeout: Double = 10, certificatePinning: CertificatePinning? = nil) {
-        guard let parts = url.getParts() else {
-            delegate?.connectionChanged(state: .failed(FoundationTransportError.invalidRequest))
-            return
-        }
-        self.certPinner = certificatePinning
-        self.isTLS = parts.isTLS
-        var readStream: Unmanaged<CFReadStream>?
-        var writeStream: Unmanaged<CFWriteStream>?
-        let h = parts.host as NSString
-        CFStreamCreatePairWithSocketToHost(nil, h, UInt32(parts.port), &readStream, &writeStream)
-        inputStream = readStream!.takeRetainedValue()
-        outputStream = writeStream!.takeRetainedValue()
-        guard let inStream = inputStream, let outStream = outputStream else {
+        withLifecycleLock {
+            guard let parts = url.getParts() else {
+                notify(.failed(FoundationTransportError.invalidRequest))
                 return
-        }
-        inStream.delegate = self
-        outStream.delegate = self
-    
-        if isTLS {
-            let key = CFStreamPropertyKey(rawValue: kCFStreamPropertySocketSecurityLevel)
-            CFReadStreamSetProperty(inStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
-            CFWriteStreamSetProperty(outStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
-        }
-        
-        onConnect?(inStream, outStream)
-        
-        isOpen = false
-        CFReadStreamSetDispatchQueue(inStream, workQueue)
-        CFWriteStreamSetDispatchQueue(outStream, workQueue)
-        inStream.open()
-        outStream.open()
-        
-        
-        workQueue.asyncAfter(deadline: .now() + timeout, execute: { [weak self] in
-            guard let s = self else { return }
-            if !s.isOpen {
-                s.delegate?.connectionChanged(state: .failed(FoundationTransportError.timeout))
             }
-        })
+            var readStream: Unmanaged<CFReadStream>?
+            var writeStream: Unmanaged<CFWriteStream>?
+            let host = parts.host as NSString
+            CFStreamCreatePairWithSocketToHost(nil, host, UInt32(parts.port), &readStream, &writeStream)
+            guard
+                let inputStream = readStream?.takeRetainedValue() as InputStream?,
+                let outputStream = writeStream?.takeRetainedValue() as OutputStream?
+            else {
+                notify(.failed(FoundationTransportError.invalidRequest))
+                return
+            }
+
+            let installation = state.withLock { state -> (generation: UInt64, oldStreams: StreamPair) in
+                let oldStreams = StreamPair(input: state.inputStream, output: state.outputStream)
+                state.generation &+= 1
+                state.certPinner = certificatePinning
+                state.isTLS = parts.isTLS
+                state.domain = parts.host
+                state.inputStream = inputStream
+                state.outputStream = outputStream
+                state.isOpen = false
+                state.hasStartedOpenValidation = false
+                state.hasFinishedOpenValidation = false
+                return (state.generation, oldStreams)
+            }
+            close(installation.oldStreams)
+
+            inputStream.delegate = self
+            outputStream.delegate = self
+
+            if parts.isTLS {
+                let key = CFStreamPropertyKey(rawValue: kCFStreamPropertySocketSecurityLevel)
+                CFReadStreamSetProperty(inputStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
+                CFWriteStreamSetProperty(outputStream, key, kCFStreamSocketSecurityLevelNegotiatedSSL)
+            }
+
+            onConnect?(inputStream, outputStream)
+            guard isCurrent(generation: installation.generation, stream: inputStream) else { return }
+
+            CFReadStreamSetDispatchQueue(inputStream, workQueue)
+            CFWriteStreamSetDispatchQueue(outputStream, workQueue)
+            inputStream.open()
+            outputStream.open()
+
+            let generation = installation.generation
+            workQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+                self?.handleTimeout(generation: generation)
+            }
+        }
     }
     
     public func disconnect() {
-        if let stream = inputStream {
-            stream.delegate = nil
-            CFReadStreamSetDispatchQueue(stream, nil)
-            stream.close()
+        withLifecycleLock {
+            close(invalidateCurrent())
         }
-        if let stream = outputStream {
-            stream.delegate = nil
-            CFWriteStreamSetDispatchQueue(stream, nil)
-            stream.close()
-        }
-        isOpen = false
-        outputStream = nil
-        inputStream = nil
     }
     
     public func register(delegate: TransportEventClient) {
-        self.delegate = delegate
+        state.withLock { $0.delegate = WeakReference(delegate) }
     }
     
-    public func write(data: Data, completion: @escaping ((Error?) -> ())) {
-        guard let outStream = outputStream else {
-            completion(FoundationTransportError.invalidOutputStream)
-            return
+    public func write(data: Data, completion: @escaping @Sendable ((any Error)?) -> Void) {
+        let generation = withLifecycleLock {
+            state.withLock { state in
+                state.outputStream == nil ? nil : state.generation
+            }
         }
-        var total = 0
-        let buffer = UnsafeRawPointer((data as NSData).bytes).assumingMemoryBound(to: UInt8.self)
-        //NOTE: this might need to be dispatched to the work queue instead of being written inline. TBD.
-        while total < data.count {
-            let written = outStream.write(buffer, maxLength: data.count)
-            if written < 0 {
+        workQueue.async { [weak self] in
+            guard let self, let generation else {
                 completion(FoundationTransportError.invalidOutputStream)
                 return
             }
-            total += written
+            let result: (any Error)? = self.withLifecycleLock {
+                guard let outputStream = self.state.withLock({ state -> OutputStream? in
+                    guard state.generation == generation else { return nil }
+                    return state.outputStream
+                }) else {
+                    return FoundationTransportError.invalidOutputStream
+                }
+
+                return data.withUnsafeBytes { rawBuffer in
+                    guard let baseAddress = rawBuffer.bindMemory(to: UInt8.self).baseAddress else {
+                        return nil
+                    }
+                    var total = 0
+                    while total < data.count {
+                        let written = outputStream.write(
+                            baseAddress.advanced(by: total),
+                            maxLength: data.count - total
+                        )
+                        guard written > 0 else {
+                            return outputStream.streamError ?? FoundationTransportError.invalidOutputStream
+                        }
+                        total += written
+                    }
+                    return nil
+                }
+            }
+            completion(result)
         }
-        completion(nil)
     }
     
-    private func getSecurityData() -> (SecTrust?, String?) {
+    private func getSecurityData(generation: UInt64) -> (SecTrust?, String?) {
         #if os(watchOS)
         return (nil, nil)
         #else
-        guard let outputStream = outputStream else {
+        guard let snapshot = state.withLock({ state -> (OutputStream, String?)? in
+            guard state.generation == generation, let outputStream = state.outputStream else {
+                return nil
+            }
+            return (outputStream, state.domain)
+        }) else {
             return (nil, nil)
         }
-        let trust = outputStream.property(forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey) as! SecTrust?
-        var domain = outputStream.property(forKey: kCFStreamSSLPeerName as Stream.PropertyKey) as! String?
-        
-        if domain == nil,
-            let sslContextOut = CFWriteStreamCopyProperty(outputStream, CFStreamPropertyKey(rawValue: kCFStreamPropertySSLContext)) as! SSLContext? {
-            var peerNameLen: Int = 0
-            SSLGetPeerDomainNameLength(sslContextOut, &peerNameLen)
-            var peerName = Data(count: peerNameLen)
-            let _ = peerName.withUnsafeMutableBytes { (peerNamePtr: UnsafeMutablePointer<Int8>) in
-                SSLGetPeerDomainName(sslContextOut, peerNamePtr, &peerNameLen)
-            }
-            if let peerDomain = String(bytes: peerName, encoding: .utf8), peerDomain.count > 0 {
-                domain = peerDomain
-            }
-        }
-        return (trust, domain)
+        let trust: SecTrust? = conditionalCast(snapshot.0.property(
+            forKey: kCFStreamPropertySSLPeerTrust as Stream.PropertyKey
+        ))
+        return (trust, snapshot.1)
         #endif
     }
     
-    private func read() {
-        guard let stream = inputStream else {
-            return
-        }
+    private func read(stream: InputStream, generation: UInt64) {
+        guard isCurrent(generation: generation, stream: stream) else { return }
         let maxBuffer = 4096
         let buf = NSMutableData(capacity: maxBuffer)
         let buffer = UnsafeMutableRawPointer(mutating: buf!.bytes).assumingMemoryBound(to: UInt8.self)
@@ -171,48 +200,187 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate {
             return
         }
         let data = Data(bytes: buffer, count: length)
-        delegate?.connectionChanged(state: .receive(data))
+        notify(.receive(data), generation: generation, stream: stream)
     }
     
     // MARK: - StreamDelegate
     
-    open func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
-        switch eventCode {
-        case .hasBytesAvailable:
-            if aStream == inputStream {
-                read()
-            }
-        case .errorOccurred:
-            delegate?.connectionChanged(state: .failed(aStream.streamError))
-        case .endEncountered:
-            if aStream == inputStream {
-                delegate?.connectionChanged(state: .cancelled)
-            }
-        case .openCompleted:
-            if aStream == inputStream {
-                let (trust, domain) = getSecurityData()
-                if let pinner = certPinner, let trust = trust {
-                    pinner.evaluateTrust(trust: trust, domain:  domain, completion: { [weak self] (state) in
-                        switch state {
-                        case .success:
-                            self?.isOpen = true
-                            self?.delegate?.connectionChanged(state: .connected)
-                        case .failed(let error):
-                            self?.delegate?.connectionChanged(state: .failed(error))
-                        }
-                        
-                    })
-                } else {
-                    isOpen = true
-                    delegate?.connectionChanged(state: .connected)
+    public func stream(_ aStream: Stream, handle eventCode: Stream.Event) {
+        withLifecycleLock {
+            guard let identity = streamIdentity(aStream) else { return }
+            switch eventCode {
+            case .hasBytesAvailable:
+                if identity.isInput, let inputStream = aStream as? InputStream {
+                    read(stream: inputStream, generation: identity.generation)
                 }
+            case .errorOccurred:
+                notify(.failed(aStream.streamError), generation: identity.generation, stream: aStream)
+            case .endEncountered:
+                if identity.isInput {
+                    notify(.peerClosed, generation: identity.generation, stream: aStream)
+                }
+            case .openCompleted:
+                if identity.isInput {
+                    beginOpenValidation(generation: identity.generation)
+                }
+            default:
+                break
             }
-        case .endEncountered:
-            if aStream == inputStream {
-                delegate?.connectionChanged(state: .cancelled)
-            }
-        default:
-            break
         }
     }
+
+    private func beginOpenValidation(generation: UInt64) {
+        let validation = state.withLock { state -> (shouldStart: Bool, pinner: (any CertificatePinning)?) in
+            guard state.generation == generation, !state.hasStartedOpenValidation else {
+                return (false, nil)
+            }
+            state.hasStartedOpenValidation = true
+            return (true, state.certPinner)
+        }
+        guard validation.shouldStart else { return }
+
+        let (trust, domain) = getSecurityData(generation: generation)
+        if let pinner = validation.pinner {
+            guard let trust else {
+                finishOpenValidation(
+                    .failed(FoundationTransportError.missingPeerTrust),
+                    generation: generation
+                )
+                return
+            }
+            pinner.evaluateTrust(trust: trust, domain: domain) { [weak self] result in
+                self?.finishOpenValidation(result, generation: generation)
+            }
+        } else {
+            finishOpenValidation(.success, generation: generation)
+        }
+    }
+
+    private func finishOpenValidation(_ result: PinningState, generation: UInt64) {
+        withLifecycleLock {
+            let shouldFinish = state.withLock { state -> Bool in
+                guard state.generation == generation, !state.hasFinishedOpenValidation else {
+                    return false
+                }
+                state.hasFinishedOpenValidation = true
+                if case .success = result {
+                    state.isOpen = true
+                }
+                return true
+            }
+            guard shouldFinish else { return }
+
+            switch result {
+            case .success:
+                notify(.connected, generation: generation)
+            case .failed(let error):
+                notify(.failed(error), generation: generation)
+                disconnectCurrent(generation: generation)
+            }
+        }
+    }
+
+    private func handleTimeout(generation: UInt64) {
+        withLifecycleLock {
+            let shouldTimeout = state.withLock { state in
+                state.generation == generation && !state.isOpen
+            }
+            guard shouldTimeout else { return }
+            notify(.failed(FoundationTransportError.timeout), generation: generation)
+            disconnectCurrent(generation: generation)
+        }
+    }
+
+    private struct StreamPair {
+        var input: InputStream?
+        var output: OutputStream?
+    }
+
+    private func invalidateCurrent(generation expectedGeneration: UInt64? = nil) -> StreamPair {
+        state.withLock { state in
+            if let expectedGeneration, state.generation != expectedGeneration {
+                return StreamPair()
+            }
+            let streams = StreamPair(input: state.inputStream, output: state.outputStream)
+            state.generation &+= 1
+            state.isOpen = false
+            state.outputStream = nil
+            state.inputStream = nil
+            state.certPinner = nil
+            state.domain = nil
+            state.hasStartedOpenValidation = false
+            state.hasFinishedOpenValidation = false
+            return streams
+        }
+    }
+
+    private func disconnectCurrent(generation: UInt64) {
+        close(invalidateCurrent(generation: generation))
+    }
+
+    private func close(_ streams: StreamPair) {
+        if let inputStream = streams.input {
+            inputStream.delegate = nil
+            CFReadStreamSetDispatchQueue(inputStream, nil)
+            inputStream.close()
+        }
+        if let outputStream = streams.output {
+            outputStream.delegate = nil
+            CFWriteStreamSetDispatchQueue(outputStream, nil)
+            outputStream.close()
+        }
+    }
+
+    private func streamIdentity(_ stream: Stream) -> (generation: UInt64, isInput: Bool)? {
+        state.withLock { state in
+            if state.inputStream === stream {
+                return (state.generation, true)
+            }
+            if state.outputStream === stream {
+                return (state.generation, false)
+            }
+            return nil
+        }
+    }
+
+    private func isCurrent(generation: UInt64, stream: Stream? = nil) -> Bool {
+        state.withLock { state in
+            guard state.generation == generation else { return false }
+            guard let stream else { return true }
+            return state.inputStream === stream || state.outputStream === stream
+        }
+    }
+
+    private func notify(
+        _ event: ConnectionState,
+        generation: UInt64? = nil,
+        stream: Stream? = nil
+    ) {
+        withLifecycleLock {
+            let delegate = state.withLock { state -> (any TransportEventClient)? in
+                if let generation, state.generation != generation { return nil }
+                if let stream,
+                    state.inputStream !== stream,
+                    state.outputStream !== stream
+                {
+                    return nil
+                }
+                return state.delegate.value
+            }
+            delegate?.connectionChanged(state: event)
+        }
+    }
+
+    private func withLifecycleLock<T>(_ body: () throws -> T) rethrows -> T {
+        lifecycleLock.lock()
+        defer { lifecycleLock.unlock() }
+        return try body()
+    }
+}
+
+/// Core Foundation's imported reference types can trigger an incorrect "always succeeds"
+/// diagnostic when conditionally cast at a concrete call site. Keeping the checked cast generic
+/// preserves the intended fail-closed behavior without a force cast.
+private func conditionalCast<Value>(_ value: Any?) -> Value? {
+    value as? Value
 }

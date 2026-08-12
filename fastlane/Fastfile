@@ -1,12 +1,23 @@
 default_platform(:ios)
 
-update_fastlane
-
+require "json"
 
 desc "Run tests"
 lane :test do
+  device = ENV["STARSCREAM_TEST_DEVICE"]
+  if device.to_s.empty?
+    simulator_json = sh("xcrun simctl list devices available -j", log: false)
+    simulators = JSON.parse(simulator_json).fetch("devices").values.flatten
+    device = simulators.find { |candidate| candidate.fetch("name").start_with?("iPhone") }&.fetch("name")
+  end
+
+  UI.user_error!("No available iPhone simulator was found") if device.to_s.empty?
+
   run_tests(
-    devices: ["iPhone 14 Pro", "iPad Pro (11-inch) (4th generation)"],
+    project: "Starscream.xcodeproj",
+    scheme: "Starscream",
+    devices: [device],
+    clean: true,
   )
 end
 

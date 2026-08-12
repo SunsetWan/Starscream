@@ -2,6 +2,18 @@
 All notable changes to this project will be documented in this file.
 `Starscream` adheres to [Semantic Versioning](http://semver.org/).
 
+### 5.0.0
+
+- Raise the minimum supported versions to iOS 15, macOS 10.15, tvOS 13, and watchOS 6.
+- Build the library and tests in Swift 6 language mode with Complete strict-concurrency checking.
+- Tighten RFC 6455 handshakes, masking, framing, fragmentation, control frames, UTF-8 validation, close handling, and implementation-specific resource limits.
+- Validate permessage-deflate negotiation and bound decompressed output according to RFC 7692.
+- Add certificate and public-key pinning policies, mutual TLS identities, and system proxy configuration with an iOS 15–16 HTTP CONNECT fallback.
+- Replace the XCTest suite with Swift Testing and add lifecycle, reconnect, transport, security, server, and malformed-wire coverage.
+- Add pull-request CI for Swift Package and iOS builds/tests.
+
+This is a source-breaking release for custom `Engine`, `CompressionHandler`, `CertificatePinning`, and related protocol conformers. See the README migration section for the Swift 6 and `Sendable` requirements.
+
 ### [4.0.4](https://github.com/daltoniam/Starscream/tree/4.0.4)
 
 Bug fixes for 4.0.3.

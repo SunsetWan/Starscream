@@ -20,182 +20,124 @@
 //
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
-import XCTest
+import Foundation
+import Testing
 @testable import Starscream
 
-class FuzzingTests: XCTestCase {
-    
-    var websocket: WebSocket!
-    var server: MockServer!
-    var uuid = ""
-    
-    override func setUp() {
-        super.setUp()
-        
-        let s = MockServer()
-        let _ = s.start(address: "", port: 0)
-        server = s
-        
-        let transport = MockTransport(server: s)
-        uuid = transport.uuid
-        
-        let url = URL(string: "http://vluxe.io/ws")! //domain doesn't matter with the mock transport
-        let request = URLRequest(url: url)        
-        websocket = WebSocket(request: request, engine: WSEngine(transport: transport))
-        
+@Suite("RFC 6455 echo boundaries")
+struct FuzzingTests {
+    enum MessageKind: String, Sendable, CustomTestStringConvertible {
+        case text
+        case binary
+
+        var testDescription: String { rawValue }
     }
-    
-    override func tearDown() {
-        super.tearDown()
+
+    struct EchoCase: Sendable, CustomTestStringConvertible {
+        let kind: MessageKind
+        let length: Int
+
+        var testDescription: String { "\(kind.rawValue)-\(length)-bytes" }
     }
-    
-    func runWebsocket(timeout: TimeInterval = 10, serverAction: @escaping ((ServerEvent) -> Bool)) {
-        let e = expectation(description: "Websocket event timeout")
+
+    private static let cases = [0, 125, 126, 127, 128, 65_535, 65_536].flatMap { length in
+        [
+            EchoCase(kind: .text, length: length),
+            EchoCase(kind: .binary, length: length),
+        ]
+    }
+
+    @Test("Echoes RFC payload length boundaries", arguments: cases)
+    func echoBoundary(testCase: EchoCase) async throws {
+        let payload = Data(repeating: 0x2A, count: testCase.length)
+        let opcode: FrameOpCode = testCase.kind == .text ? .textFrame : .binaryFrame
+        let outcome = try await runEcho(payload: payload, opcode: opcode)
+
+        switch outcome {
+        case .text(let value):
+            #expect(testCase.kind == .text)
+            #expect(Data(value.utf8) == payload)
+        case .binary(let value):
+            #expect(testCase.kind == .binary)
+            #expect(value == payload)
+        case .unexpected(let description):
+            Issue.record("Unexpected server event: \(description)")
+        }
+    }
+
+    private func runEcho(payload: Data, opcode: FrameOpCode) async throws -> EchoOutcome {
+        let server = MockServer()
+        _ = server.start(address: "", port: 0)
+        let transport = MockTransport(server: server)
+        let request = URLRequest(url: URL(string: "http://vluxe.io/ws")!)
+        let webSocket = WebSocket(
+            request: request,
+            engine: WSEngine(transport: transport)
+        )
+
+        let (events, continuation) = AsyncStream<EchoOutcome>.makeStream()
         server.onEvent = { event in
-            let done = serverAction(event)
-            if done {
-                e.fulfill()
+            switch event {
+            case .connected(let connection, _):
+                connection.write(data: payload, opcode: opcode)
+            case .text(_, let text):
+                continuation.yield(.text(text))
+                continuation.finish()
+            case .binary(_, let data):
+                continuation.yield(.binary(data))
+                continuation.finish()
+            case .disconnected:
+                break
+            case .pong:
+                continuation.yield(.unexpected("pong"))
+                continuation.finish()
+            case .ping:
+                continuation.yield(.unexpected("ping"))
+                continuation.finish()
             }
         }
-        
-        websocket.onEvent = { event in
+
+        webSocket.onEvent = { event in
             switch event {
             case .text(let string):
-                self.websocket.write(string: string)
+                webSocket.write(string: string)
             case .binary(let data):
-                self.websocket.write(data: data)
-            case .ping(_):
-                break
-            case .pong(_):
-                break
-            case .connected(_):
-                break
-            case .disconnected(let reason, let code):
-                print("reason: \(reason) code: \(code)")
-            case .error(_):
-                break
-            case .viabilityChanged(_):
-                break
-            case .reconnectSuggested(_):
-                break
-            case .cancelled:
-                break
-            case .peerClosed:
-                break
-            }
-        }
-        websocket.connect()
-        waitForExpectations(timeout: timeout) { error in
-            if let error = error {
-                XCTFail("waitForExpectationsWithTimeout errored: \(error)")
-            }
-        }
-    }
-    
-    func sendMessage(string: String, isBinary: Bool) {
-        let payload = string.data(using: .utf8)!
-        let code: FrameOpCode = isBinary ? .binaryFrame : .textFrame
-        runWebsocket { event in
-            switch event {
-            case .connected(let conn, _):
-                conn.write(data: payload, opcode: code)
-            case .text(let conn, let text):
-                if text == string && !isBinary {
-                    conn.write(data: Data(), opcode: .connectionClose)
-                    return true //success!
-                } else {
-                    XCTFail("text does not match: source: [\(string)] response: [\(text)]")
-                }
-            case .binary(let conn, let data):
-                if payload.count == data.count && isBinary {
-                    conn.write(data: Data(), opcode: .connectionClose)
-                    return true //success!
-                } else {
-                    XCTFail("binary does not match: source: [\(payload.count)] response: [\(data.count)]")
-                }
-                case .disconnected(_, _, _):
-                    return false
+                webSocket.write(data: data)
+            case .error(let error):
+                continuation.yield(.unexpected("client error: \(String(describing: error))"))
+                continuation.finish()
             default:
-                XCTFail("recieved unexpected server event: \(event)")
+                break
             }
-            return false
+        }
+        webSocket.connect()
+
+        return try await withThrowingTaskGroup(of: EchoOutcome.self) { group in
+            group.addTask {
+                for await event in events {
+                    return event
+                }
+                throw EchoTestError.streamEnded
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 5_000_000_000)
+                throw EchoTestError.timedOut
+            }
+            let result = try await group.next()!
+            group.cancelAll()
+            webSocket.forceDisconnect()
+            return result
         }
     }
-    
-    //These are the Autobahn test cases as unit tests
-    
-    
-    /// MARK : - Framing cases
-    
-    // case 1.1.1
-    func testCase1() {
-        sendMessage(string: "", isBinary: false)
-    }
-    
-    // case 1.1.2
-    func testCase2() {
-        sendMessage(string: String(repeating: "*", count: 125), isBinary: false)
-    }
-    
-    // case 1.1.3
-    func testCase3() {
-        sendMessage(string: String(repeating: "*", count: 126), isBinary: false)
-    }
-    
-    // case 1.1.4
-    func testCase4() {
-        sendMessage(string: String(repeating: "*", count: 127), isBinary: false)
-    }
-    
-    // case 1.1.5
-    func testCase5() {
-        sendMessage(string: String(repeating: "*", count: 128), isBinary: false)
-    }
-    
-    // case 1.1.6
-    func testCase6() {
-        sendMessage(string: String(repeating: "*", count: 65535), isBinary: false)
-    }
-    
-    // case 1.1.7, 1.1.8
-    func testCase7() {
-        sendMessage(string: String(repeating: "*", count: 65536), isBinary: false)
-    }
-    
-    // case 1.2.1
-    func testCase9() {
-        sendMessage(string: "", isBinary: true)
-    }
-    
-    // case 1.2.2
-    func testCase10() {
-        sendMessage(string: String(repeating: "*", count: 125), isBinary: true)
-    }
-    
-    // case 1.2.3
-    func testCase11() {
-        sendMessage(string: String(repeating: "*", count: 126), isBinary: true)
-    }
-    
-    // case 1.2.4
-    func testCase12() {
-        sendMessage(string: String(repeating: "*", count: 127), isBinary: true)
-    }
-    
-    // case 1.2.5
-    func testCase13() {
-        sendMessage(string: String(repeating: "*", count: 128), isBinary: true)
-    }
-    
-    // case 1.2.6
-    func testCase14() {
-        sendMessage(string: String(repeating: "*", count: 65535), isBinary: true)
-    }
-    
-    // case 1.2.7, 1.2.8
-    func testCase15() {
-        sendMessage(string: String(repeating: "*", count: 65536), isBinary: true)
-    }
-    
-    //TODO: the rest of them.
+}
+
+private enum EchoOutcome: Sendable {
+    case text(String)
+    case binary(Data)
+    case unexpected(String)
+}
+
+private enum EchoTestError: Error {
+    case streamEnded
+    case timedOut
 }

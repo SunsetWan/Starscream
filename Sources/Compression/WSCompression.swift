@@ -29,76 +29,178 @@
 import Foundation
 import zlib
 
-public class WSCompression: CompressionHandler {
-    let headerWSExtensionName = "Sec-WebSocket-Extensions"
-    var decompressor: Decompressor?
-    var compressor: Compressor?
-    var decompressorTakeOver = false
-    var compressorTakeOver = false
-    
-    public init() {
-        
+public final class WSCompression: CompressionHandler {
+    private struct State {
+        var decompressor: Decompressor?
+        var compressor: Compressor?
+        var decompressorNoContextTakeover = false
+        var compressorNoContextTakeover = false
+        var decompressedMessageBytes = 0
     }
-    
-    public func load(headers: [String: String]) {
-        guard let extensionHeader = headers[headerWSExtensionName] else { return }
-        decompressorTakeOver = false
-        compressorTakeOver = false
 
-        // assume defaults unless the headers say otherwise
-        compressor = Compressor(windowBits: 15)
-        decompressor = Decompressor(windowBits: 15)
-        
-        let parts = extensionHeader.components(separatedBy: ";")
-        for p in parts {
-            let part = p.trimmingCharacters(in: .whitespaces)
-            if part.hasPrefix("server_max_window_bits=") {
-                let valString = part.components(separatedBy: "=")[1]
-                if let val = Int(valString.trimmingCharacters(in: .whitespaces)) {
-                    decompressor = Decompressor(windowBits: val)
+    private static let extensionHeaderName = "Sec-WebSocket-Extensions"
+    private static let perMessageDeflate = "permessage-deflate"
+    private let state = Locked(State())
+    private let maximumDecompressedMessageSize: Int
+
+    public init(
+        maximumDecompressedMessageSize: Int = WebSocketLimits.default.maximumDecompressedMessageSize
+    ) {
+        self.maximumDecompressedMessageSize = max(0, maximumDecompressedMessageSize)
+    }
+
+    public convenience init(limits: WebSocketLimits) {
+        self.init(maximumDecompressedMessageSize: limits.maximumDecompressedMessageSize)
+    }
+    
+    @discardableResult
+    public func load(headers: [String: String]) -> Bool {
+        guard let extensionHeader = headers.first(where: {
+            $0.key.caseInsensitiveCompare(Self.extensionHeaderName) == .orderedSame
+        })?.value,
+              let negotiatedState = Self.parseNegotiatedState(extensionHeader) else {
+            reset()
+            return false
+        }
+
+        state.withLock { $0 = negotiatedState }
+        return true
+    }
+
+    public func reset() {
+        state.withLock { $0 = State() }
+    }
+
+    public func decompress(data: Data, isFinal: Bool) throws -> Data {
+        try state.withLock { state in
+            guard let decompressor = state.decompressor else {
+                throw WSError(
+                    type: .compressionError,
+                    message: "permessage-deflate was not negotiated",
+                    code: CloseCode.protocolError.rawValue
+                )
+            }
+
+            do {
+                guard state.decompressedMessageBytes <= maximumDecompressedMessageSize else {
+                    throw Self.messageTooBigError(maximum: maximumDecompressedMessageSize)
                 }
-            } else if part.hasPrefix("client_max_window_bits=") {
-                let valString = part.components(separatedBy: "=")[1]
-                if let val = Int(valString.trimmingCharacters(in: .whitespaces)) {
-                    compressor = Compressor(windowBits: val)
+                let remaining = maximumDecompressedMessageSize - state.decompressedMessageBytes
+                let decompressedData = try decompressor.decompress(
+                    data,
+                    finish: isFinal,
+                    maximumOutputSize: remaining
+                )
+                state.decompressedMessageBytes += decompressedData.count
+                if state.decompressorNoContextTakeover && isFinal {
+                    try decompressor.reset()
                 }
-            } else if part == "client_no_context_takeover" {
-                compressorTakeOver = true
-            } else if part == "server_no_context_takeover" {
-                decompressorTakeOver = true
+                if isFinal {
+                    state.decompressedMessageBytes = 0
+                }
+                return decompressedData
+            } catch {
+                // An inflater cannot be safely reused after a stream error.
+                state.decompressor = nil
+                state.decompressedMessageBytes = 0
+                throw error
             }
         }
     }
-    
-    public func decompress(data: Data, isFinal: Bool) -> Data? {
-        guard let decompressor = decompressor else { return nil }
-        do {
-            let decompressedData = try decompressor.decompress(data, finish: isFinal)
-            if decompressorTakeOver {
-                try decompressor.reset()
-            }
-            return decompressedData
-        } catch {
-            //do nothing with the error for now
-        }
-        return nil
-    }
-    
+
     public func compress(data: Data) -> Data? {
-        guard let compressor = compressor else { return nil }
-        do {
-            let compressedData = try compressor.compress(data)
-            if compressorTakeOver {
-                try compressor.reset()
+        state.withLock { state in
+            guard let compressor = state.compressor else { return nil }
+            do {
+                let compressedData = try compressor.compress(data)
+                if state.compressorNoContextTakeover {
+                    try compressor.reset()
+                }
+                return compressedData
+            } catch {
+                // A deflater cannot be safely reused after a stream error.
+                state.compressor = nil
+                return nil
             }
-            return compressedData
-        } catch {
-            //do nothing with the error for now
         }
-        return nil
     }
-    
 
+    private static func parseNegotiatedState(_ header: String) -> State? {
+        let selections = header.split(separator: ",", omittingEmptySubsequences: false).map {
+            $0.trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        // Starscream implements one extension. Accepting a second selection
+        // would require understanding how it composes RSV bits and payload data.
+        guard selections.count == 1 else { return nil }
+
+        let parts = selections[0].split(
+            separator: ";",
+            omittingEmptySubsequences: false
+        ).map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+        guard let name = parts.first,
+              name.caseInsensitiveCompare(perMessageDeflate) == .orderedSame else {
+            return nil
+        }
+
+        var compressorWindowBits = 15
+        var decompressorWindowBits = 15
+        var compressorNoContextTakeover = false
+        var decompressorNoContextTakeover = false
+        var seenParameters = Set<String>()
+        for part in parts.dropFirst() {
+            let pair = part.split(
+                separator: "=",
+                maxSplits: 1,
+                omittingEmptySubsequences: false
+            ).map {
+                $0.trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+            guard let rawParameter = pair.first, !rawParameter.isEmpty else {
+                return nil
+            }
+            let parameter = rawParameter.lowercased()
+            guard seenParameters.insert(parameter).inserted else {
+                return nil
+            }
+
+            let normalizedValue = pair.count == 2
+                ? WebSocketHandshake.normalizedExtensionParameterValue(pair[1])
+                : nil
+            if parameter == "server_max_window_bits", pair.count == 2,
+               let normalizedValue, let val = Int(normalizedValue), (8...15).contains(val) {
+                decompressorWindowBits = val
+            } else if parameter == "client_max_window_bits", pair.count == 2,
+                      let normalizedValue, let val = Int(normalizedValue), (8...15).contains(val) {
+                compressorWindowBits = val
+            } else if parameter == "client_no_context_takeover", pair.count == 1 {
+                compressorNoContextTakeover = true
+            } else if parameter == "server_no_context_takeover", pair.count == 1 {
+                decompressorNoContextTakeover = true
+            } else {
+                return nil
+            }
+        }
+
+        guard let compressor = Compressor(windowBits: compressorWindowBits),
+              let decompressor = Decompressor(windowBits: decompressorWindowBits) else {
+            return nil
+        }
+
+        return State(
+            decompressor: decompressor,
+            compressor: compressor,
+            decompressorNoContextTakeover: decompressorNoContextTakeover,
+            compressorNoContextTakeover: compressorNoContextTakeover
+        )
+    }
+
+    private static func messageTooBigError(maximum: Int) -> WSError {
+        WSError(
+            type: .compressionError,
+            message: "decompressed message exceeds the configured maximum of \(maximum) bytes",
+            code: CloseCode.messageTooBig.rawValue
+        )
+    }
 }
 
 class Decompressor {
@@ -127,46 +229,84 @@ class Decompressor {
         guard initInflate() else { throw WSError(type: .compressionError, message: "Error for decompressor on reset", code: 0) }
     }
 
-    func decompress(_ data: Data, finish: Bool) throws -> Data {
-        return try data.withUnsafeBytes { (bytes: UnsafePointer<UInt8>) -> Data in
-            return try decompress(bytes: bytes, count: data.count, finish: finish)
-        }
-    }
-
-    func decompress(bytes: UnsafePointer<UInt8>, count: Int, finish: Bool) throws -> Data {
+    func decompress(
+        _ data: Data,
+        finish: Bool,
+        maximumOutputSize: Int = Int.max
+    ) throws -> Data {
         var decompressed = Data()
-        try decompress(bytes: bytes, count: count, out: &decompressed)
+        if !data.isEmpty {
+            try data.withUnsafeBytes { (bytes: UnsafeRawBufferPointer) in
+                guard let baseAddress = bytes.baseAddress else { return }
+                try decompress(
+                    bytes: baseAddress.assumingMemoryBound(to: UInt8.self),
+                    count: bytes.count,
+                    out: &decompressed,
+                    maximumOutputSize: maximumOutputSize
+                )
+            }
+        }
 
         if finish {
             let tail:[UInt8] = [0x00, 0x00, 0xFF, 0xFF]
-            try decompress(bytes: tail, count: tail.count, out: &decompressed)
+            try decompress(
+                bytes: tail,
+                count: tail.count,
+                out: &decompressed,
+                maximumOutputSize: maximumOutputSize
+            )
         }
 
         return decompressed
     }
 
-    private func decompress(bytes: UnsafePointer<UInt8>, count: Int, out: inout Data) throws {
+    private func decompress(
+        bytes: UnsafePointer<UInt8>,
+        count: Int,
+        out: inout Data,
+        maximumOutputSize: Int
+    ) throws {
         var res: CInt = 0
+        var outputCapacity = buffer.count
         strm.next_in = UnsafeMutablePointer<UInt8>(mutating: bytes)
         strm.avail_in = CUnsignedInt(count)
 
         repeat {
+            guard out.count <= maximumOutputSize else {
+                throw Self.messageTooBigError(maximum: maximumOutputSize)
+            }
+            let remaining = maximumOutputSize - out.count
+            // Give zlib one sentinel byte beyond the limit. This distinguishes an
+            // exact-boundary message from a stream that would produce more output,
+            // without ever appending the excess byte to `Data`.
+            outputCapacity = min(buffer.count, remaining == Int.max ? Int.max : remaining + 1)
             buffer.withUnsafeMutableBytes { (bufferPtr) in
                 strm.next_out = bufferPtr.bindMemory(to: UInt8.self).baseAddress
-                strm.avail_out = CUnsignedInt(bufferPtr.count)
+                strm.avail_out = CUnsignedInt(outputCapacity)
 
                 res = inflate(&strm, 0)
             }
 
-            let byteCount = buffer.count - Int(strm.avail_out)
+            let byteCount = outputCapacity - Int(strm.avail_out)
+            guard byteCount <= remaining else {
+                throw Self.messageTooBigError(maximum: maximumOutputSize)
+            }
             out.append(buffer, count: byteCount)
         } while res == Z_OK && strm.avail_out == 0
 
         guard (res == Z_OK && strm.avail_out > 0)
-            || (res == Z_BUF_ERROR && Int(strm.avail_out) == buffer.count)
+            || (res == Z_BUF_ERROR && Int(strm.avail_out) == outputCapacity)
             else {
                 throw WSError(type: .compressionError, message: "Error on decompressing", code: 0)
         }
+    }
+
+    private static func messageTooBigError(maximum: Int) -> WSError {
+        WSError(
+            type: .compressionError,
+            message: "decompressed output exceeds the configured maximum of \(maximum) bytes",
+            code: CloseCode.messageTooBig.rawValue
+        )
     }
 
     private func teardownInflate() {

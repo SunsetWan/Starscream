@@ -22,8 +22,12 @@
 
 import Foundation
 
-public protocol CompressionHandler {
-    func load(headers: [String: String])
-    func decompress(data: Data, isFinal: Bool) -> Data?
+public protocol CompressionHandler: AnyObject, Sendable {
+    /// Resets all connection-scoped compression state and loads a negotiated response.
+    /// Returns `true` only when permessage-deflate was validly negotiated.
+    @discardableResult
+    func load(headers: [String: String]) -> Bool
+    func reset()
+    func decompress(data: Data, isFinal: Bool) throws -> Data
     func compress(data: Data) -> Data?
 }
