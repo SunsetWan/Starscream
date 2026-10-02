@@ -22,15 +22,18 @@
 
 import Foundation
 
-public protocol EngineDelegate: AnyObject {
+public protocol EngineDelegate: AnyObject, Sendable {
     func didReceive(event: WebSocketEvent)
 }
 
-public protocol Engine {
+/// A WebSocket engine may be called from arbitrary tasks and queues.
+///
+/// Custom engines must synchronize their mutable state before conforming.
+public protocol Engine: Sendable {
     func register(delegate: EngineDelegate)
     func start(request: URLRequest)
     func stop(closeCode: UInt16)
     func forceStop()
-    func write(data: Data, opcode: FrameOpCode, completion: (() -> ())?)
-    func write(string: String, completion: (() -> ())?)
+    func write(data: Data, opcode: FrameOpCode, completion: (@Sendable () -> Void)?)
+    func write(string: String, completion: (@Sendable () -> Void)?)
 }

@@ -22,9 +22,11 @@
 
 import Foundation
 
-public enum HTTPUpgradeError: Error {
+public enum HTTPUpgradeError: Error, Sendable {
     case notAnUpgrade(Int, [String: String])
     case invalidData
+    case headerTooLarge
+    case invalidHandshake(WebSocketHandshake.ValidationError)
 }
 
 public struct HTTPWSHeader {
@@ -54,6 +56,10 @@ public struct HTTPWSHeader {
         }
         
         var req = request
+        // RFC 6455 section 4.1 requires the opening handshake to use GET. A caller may customize
+        // headers and the body, but a pre-existing URLRequest method must not turn the upgrade
+        // into a non-WebSocket HTTP request.
+        req.httpMethod = "GET"
         if request.value(forHTTPHeaderField: HTTPWSHeader.originName) == nil {
             var origin = url.absoluteString
             if let hostUrl = URL (string: "/", relativeTo: url) {
@@ -76,23 +82,25 @@ public struct HTTPWSHeader {
             }
 	     }
         
-        if supportsCompression {
+        if supportsCompression, req.value(forHTTPHeaderField: HTTPWSHeader.extensionName) == nil {
             let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
             req.setValue(val, forHTTPHeaderField: HTTPWSHeader.extensionName)
         }
-        let hostValue = req.allHTTPHeaderFields?[HTTPWSHeader.hostName] ?? "\(parts.host):\(parts.port)"
+        let host = parts.host.contains(":") ? "[\(parts.host)]" : parts.host
+        let defaultHostValue = url.port.map { "\(host):\($0)" } ?? host
+        let hostValue = req.value(forHTTPHeaderField: HTTPWSHeader.hostName) ?? defaultHostValue
         req.setValue(hostValue, forHTTPHeaderField: HTTPWSHeader.hostName)
         return req
     }
     
-    // generateWebSocketKey 16 random characters between a-z and return them as a base64 string
+    // RFC 6455 requires a randomly selected 16-byte nonce encoded as Base64.
     public static func generateWebSocketKey() -> String {
-        return Data((0..<16).map{ _ in UInt8.random(in: 97...122) }).base64EncodedString()
+        return Data((0..<16).map { _ in UInt8.random(in: .min ... .max) }).base64EncodedString()
     }
 }
 
-public enum HTTPEvent {
-    case success([String: String])
+public enum HTTPEvent: Sendable {
+    case success(headers: [String: String], leftover: Data)
     case failure(Error)
 }
 
@@ -104,6 +112,11 @@ public protocol HTTPHandler {
     func register(delegate: HTTPHandlerDelegate)
     func convert(request: URLRequest) -> Data
     func parse(data: Data) -> Int
+    func reset()
+}
+
+public extension HTTPHandler {
+    func reset() {}
 }
 
 public protocol HTTPServerDelegate: AnyObject {
@@ -116,7 +129,7 @@ public protocol HTTPServerHandler {
     func createResponse(headers: [String: String]) -> Data
 }
 
-public struct URLParts {
+public struct URLParts: Sendable {
     let port: Int
     let host: String
     let isTLS: Bool

@@ -23,14 +23,29 @@
 import Foundation
 @testable import Starscream
 
-public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, FrameCollectorDelegate {
+public final class MockConnection: Connection, HTTPServerDelegate, FramerEventClient,
+FrameCollectorDelegate, @unchecked Sendable {
+    private struct State {
+        var didUpgrade = false
+        var onEvent: (@Sendable (ConnectionEvent) -> Void)?
+        var delegate = WeakReference<any ConnectionDelegate>()
+    }
+
     let transport: MockTransport
     private let httpHandler = FoundationHTTPServerHandler()
     private let framer = WSFramer(isServer: true)
     private let frameHandler = FrameCollector()
-    private var didUpgrade = false
-    public var onEvent: ((ConnectionEvent) -> Void)?
-    fileprivate weak var delegate: ConnectionDelegate?
+    private let state = Locked(State())
+
+    public var onEvent: (@Sendable (ConnectionEvent) -> Void)? {
+        get { state.withLock { $0.onEvent } }
+        set { state.withLock { $0.onEvent = newValue } }
+    }
+
+    fileprivate weak var delegate: ConnectionDelegate? {
+        get { state.withLock { $0.delegate.value } }
+        set { state.withLock { $0.delegate = WeakReference(newValue) } }
+    }
     
     init(transport: MockTransport) {
         self.transport = transport
@@ -40,7 +55,7 @@ public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, 
     }
     
     func add(data: Data) {
-        if !didUpgrade {
+        if !state.withLock({ $0.didUpgrade }) {
             httpHandler.parse(data: data)
         } else {
             framer.add(data: data)
@@ -56,13 +71,14 @@ public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, 
     
     public func didReceive(event: HTTPEvent) {
         switch event {
-        case .success(let headers):
-            didUpgrade = true
-            //TODO: add headers and key check?
+        case .success(let headers, let leftover):
+            state.withLock { $0.didUpgrade = true }
             let response = httpHandler.createResponse(headers: [:])
             transport.received(data: response)
-            delegate?.didReceive(event: .connected(self, headers))
-            onEvent?(.connected(headers))
+            emit(server: .connected(self, headers), connection: .connected(headers))
+            if !leftover.isEmpty {
+                framer.add(data: leftover)
+            }
         case .failure(let error):
             onEvent?(.error(error))
         }
@@ -82,35 +98,48 @@ public class MockConnection: Connection, HTTPServerDelegate, FramerEventClient, 
     public func didForm(event: FrameCollector.Event) {
         switch event {
         case .text(let string):
-            delegate?.didReceive(event: .text(self, string))
-            onEvent?(.text(string))
+            emit(server: .text(self, string), connection: .text(string))
         case .binary(let data):
-            delegate?.didReceive(event: .binary(self, data))
-            onEvent?(.binary(data))
+            emit(server: .binary(self, data), connection: .binary(data))
         case .pong(let data):
-            delegate?.didReceive(event: .pong(self, data))
-            onEvent?(.pong(data))
+            emit(server: .pong(self, data), connection: .pong(data))
         case .ping(let data):
-            delegate?.didReceive(event: .ping(self, data))
-            onEvent?(.ping(data))
+            emit(server: .ping(self, data), connection: .ping(data))
         case .closed(let reason, let code):
-            delegate?.didReceive(event: .disconnected(self, reason, code))
-            onEvent?(.disconnected(reason, code))
+            emit(server: .disconnected(self, reason, code), connection: .disconnected(reason, code))
         case .error(let error):
             onEvent?(.error(error))
         }
     }
     
-    public func decompress(data: Data, isFinal: Bool) -> Data? {
-        return nil
+    public func decompress(data: Data, isFinal: Bool) throws -> Data {
+        throw WSError(
+            type: .protocolError,
+            message: "compression was not negotiated by MockConnection",
+            code: CloseCode.protocolError.rawValue
+        )
+    }
+
+    private func emit(server: ServerEvent, connection: ConnectionEvent) {
+        let callbacks = state.withLock { ($0.delegate.value, $0.onEvent) }
+        callbacks.0?.didReceive(event: server)
+        callbacks.1?(connection)
     }
 }
     
 
-public class MockServer: Server, ConnectionDelegate {
-    fileprivate var connections = [String: MockConnection]()
-    
-    public var onEvent: ((ServerEvent) -> Void)?
+public final class MockServer: Server, ConnectionDelegate, @unchecked Sendable {
+    private struct State {
+        var connections = [String: MockConnection]()
+        var onEvent: (@Sendable (ServerEvent) -> Void)?
+    }
+
+    private let state = Locked(State())
+
+    public var onEvent: (@Sendable (ServerEvent) -> Void)? {
+        get { state.withLock { $0.onEvent } }
+        set { state.withLock { $0.onEvent = newValue } }
+    }
     
     public func start(address: String, port: UInt16) -> Error? {
         return nil
@@ -119,19 +148,15 @@ public class MockServer: Server, ConnectionDelegate {
     public func connect(transport: MockTransport) {
         let conn = MockConnection(transport: transport)
         conn.delegate = self
-        connections[transport.uuid] = conn
+        state.withLock { $0.connections[transport.uuid] = conn }
     }
     
     public func disconnect(uuid: String) {
-//        guard let conn = connections[uuid] else {
-//            return
-//        }
-        //TODO: force disconnect
-        connections.removeValue(forKey: uuid)
+        state.withLock { $0.connections.removeValue(forKey: uuid) }
     }
     
     public func write(data: Data, uuid: String) {
-        guard let conn = connections[uuid] else {
+        guard let conn = state.withLock({ $0.connections[uuid] }) else {
             return
         }
         conn.add(data: data)
@@ -139,6 +164,6 @@ public class MockServer: Server, ConnectionDelegate {
     
     /// MARK: - MockConnectionDelegate
     public func didReceive(event: ServerEvent) {
-        onEvent?(event)
+        state.withLock { $0.onEvent }?(event)
     }
 }

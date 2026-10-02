@@ -34,6 +34,22 @@ public enum ConnectionEvent {
 
 public protocol Connection {
     func write(data: Data, opcode: FrameOpCode)
+    func write(
+        data: Data,
+        opcode: FrameOpCode,
+        completion: @escaping @Sendable (Error?) -> Void
+    )
+}
+
+public extension Connection {
+    func write(
+        data: Data,
+        opcode: FrameOpCode,
+        completion: @escaping @Sendable (Error?) -> Void
+    ) {
+        write(data: data, opcode: opcode)
+        completion(nil)
+    }
 }
 
 public protocol ConnectionDelegate: AnyObject {
@@ -52,5 +68,3 @@ public enum ServerEvent {
 public protocol Server {
     func start(address: String, port: UInt16) -> Error?
 }
-
-

@@ -12,5 +12,5 @@ assignees: ''
 
 ### Environment:
 - OS/Version: [e.g. iOS/13.3]
-- Starscream Version [e.g. 4.0.4]
+- Starscream Version [e.g. 5.0.0]
 - Xcode version [e.g. 11.5]
