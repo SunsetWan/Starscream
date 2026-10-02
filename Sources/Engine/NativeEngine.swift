@@ -107,6 +107,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         var session: URLSession?
         var task: URLSessionWebSocketTask?
         var receiveTask: Task<Void, Never>?
+        var pendingAuthentication = [UUID: AuthenticationCompletion]()
         var delegate = WeakReference<any EngineDelegate>()
     }
 
@@ -114,6 +115,24 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         let session: URLSession?
         let task: URLSessionWebSocketTask?
         let receiveTask: Task<Void, Never>?
+        let pendingAuthentication: [AuthenticationCompletion]
+    }
+
+    private final class AuthenticationCompletion: Sendable {
+        typealias Callback = @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        private let callback: Locked<Callback?>
+
+        init(_ callback: @escaping Callback) {
+            self.callback = Locked(callback)
+        }
+
+        func callAsFunction(_ disposition: URLSession.AuthChallengeDisposition, _ credential: URLCredential?) {
+            let callback = callback.withLock { stored in
+                defer { stored = nil }
+                return stored
+            }
+            callback?(disposition, credential)
+        }
     }
 
     /// `eventQueue` is the sole isolation domain for mutable lifecycle state and delegate delivery.
@@ -125,12 +144,14 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     private let certificatePinning: (any CertificatePinning)?
     private let proxy: WebSocketProxy?
     private let clientIdentity: WebSocketClientIdentity?
+    private let limits: WebSocketLimits
     private let dependencies: Dependencies
 
     public override init() {
         certificatePinning = nil
         proxy = nil
         clientIdentity = nil
+        limits = .default
         dependencies = .live
         super.init()
         eventQueue.setSpecific(key: queueKey, value: 1)
@@ -144,20 +165,43 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         self.certificatePinning = certificatePinning
         self.proxy = proxy
         self.clientIdentity = clientIdentity
+        limits = .default
         dependencies = .live
         super.init()
         eventQueue.setSpecific(key: queueKey, value: 1)
+    }
+
+    public init(
+        certificatePinning: (any CertificatePinning)?,
+        proxy: WebSocketProxy?,
+        clientIdentity: WebSocketClientIdentity?,
+        limits: WebSocketLimits
+    ) {
+        self.certificatePinning = certificatePinning
+        self.proxy = proxy
+        self.clientIdentity = clientIdentity
+        self.limits = limits
+        dependencies = .live
+        super.init()
+        eventQueue.setSpecific(key: queueKey, value: 1)
+    }
+
+    /// URLSession applies the message limit; frame and decompression limits require WSEngine.
+    public convenience init(limits: WebSocketLimits) {
+        self.init(certificatePinning: nil, proxy: nil, clientIdentity: nil, limits: limits)
     }
 
     init(
         certificatePinning: (any CertificatePinning)? = nil,
         proxy: WebSocketProxy? = nil,
         clientIdentity: WebSocketClientIdentity? = nil,
+        limits: WebSocketLimits = .default,
         dependencies: Dependencies
     ) {
         self.certificatePinning = certificatePinning
         self.proxy = proxy
         self.clientIdentity = clientIdentity
+        self.limits = limits
         self.dependencies = dependencies
         super.init()
         eventQueue.setSpecific(key: queueKey, value: 1)
@@ -213,6 +257,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
 
         state.session = connection.session
         state.task = connection.task
+        connection.task.maximumMessageSize = limits.maximumMessageSize
         let receive = dependencies.receive
         let receiveTask = Task { [weak self, weak webSocketTask = connection.task] in
             guard let webSocketTask else { return }
@@ -252,6 +297,11 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 ?? .normalClosure
             self.state.phase = .closing
             self.state.requestedCloseCode = UInt16(nativeCode.rawValue)
+            let pendingAuthentication = Array(self.state.pendingAuthentication.values)
+            self.state.pendingAuthentication.removeAll()
+            for complete in pendingAuthentication {
+                complete(.cancelAuthenticationChallenge, nil)
+            }
             self.state.receiveTask?.cancel()
             self.state.receiveTask = nil
             guard let task = self.state.task else {
@@ -452,15 +502,20 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         let resources = Resources(
             session: state.session,
             task: state.task,
-            receiveTask: state.receiveTask
+            receiveTask: state.receiveTask,
+            pendingAuthentication: Array(state.pendingAuthentication.values)
         )
         state.session = nil
         state.task = nil
         state.receiveTask = nil
+        state.pendingAuthentication.removeAll()
         return resources
     }
 
     private func tearDown(_ resources: Resources) {
+        for complete in resources.pendingAuthentication {
+            complete(.cancelAuthenticationChallenge, nil)
+        }
         resources.receiveTask?.cancel()
         if let task = resources.task {
             dependencies.cancel(task)
@@ -568,10 +623,11 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             URLCredential?
         ) -> Void
     ) {
+        let complete = AuthenticationCompletion(completionHandler)
         performOnEventQueue {
             guard self.isCurrent(session: session),
-                  self.state.phase != .terminal else {
-                completionHandler(.cancelAuthenticationChallenge, nil)
+                  self.state.phase == .connecting || self.state.phase == .open else {
+                complete(.cancelAuthenticationChallenge, nil)
                 return
             }
             let generation = self.state.generation
@@ -581,36 +637,39 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                     let trust = challenge.protectionSpace.serverTrust,
                     let certificatePinning = self.certificatePinning
                 else {
-                    completionHandler(.performDefaultHandling, nil)
+                    complete(.performDefaultHandling, nil)
                     return
                 }
+                let challengeID = UUID()
+                self.state.pendingAuthentication[challengeID] = complete
                 certificatePinning.evaluateTrust(
                     trust: trust,
                     domain: challenge.protectionSpace.host
                 ) { [weak self] result in
                     guard let self else {
-                        completionHandler(.cancelAuthenticationChallenge, nil)
+                        complete(.cancelAuthenticationChallenge, nil)
                         return
                     }
                     self.performOnEventQueue {
+                        self.state.pendingAuthentication.removeValue(forKey: challengeID)
                         guard generation == self.state.generation,
                               self.isCurrent(session: session),
-                              self.state.phase != .terminal else {
-                            completionHandler(.cancelAuthenticationChallenge, nil)
+                              self.state.phase == .connecting || self.state.phase == .open else {
+                            complete(.cancelAuthenticationChallenge, nil)
                             return
                         }
                         switch result {
                         case .success:
-                            completionHandler(.useCredential, URLCredential(trust: trust))
+                            complete(.useCredential, URLCredential(trust: trust))
                         case .failed:
-                            completionHandler(.cancelAuthenticationChallenge, nil)
+                            complete(.cancelAuthenticationChallenge, nil)
                         }
                     }
                 }
 
             case NSURLAuthenticationMethodClientCertificate:
                 guard let clientIdentity = self.clientIdentity else {
-                    completionHandler(.performDefaultHandling, nil)
+                    complete(.performDefaultHandling, nil)
                     return
                 }
                 do {
@@ -620,14 +679,14 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                         certificates: nil,
                         persistence: .forSession
                     )
-                    completionHandler(.useCredential, credential)
+                    complete(.useCredential, credential)
                 } catch {
-                    completionHandler(.cancelAuthenticationChallenge, nil)
+                    complete(.cancelAuthenticationChallenge, nil)
                     self.finish(generation: generation, event: .error(error))
                 }
 
             default:
-                completionHandler(.performDefaultHandling, nil)
+                complete(.performDefaultHandling, nil)
             }
         }
     }

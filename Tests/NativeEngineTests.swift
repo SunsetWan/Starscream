@@ -6,6 +6,7 @@
 //////////////////////////////////////////////////////////////////////////////////////////////////
 
 import Foundation
+@preconcurrency import Security
 #if canImport(FoundationNetworking)
 import FoundationNetworking
 #endif
@@ -14,6 +15,106 @@ import Testing
 
 @Suite("NativeEngine lifecycle")
 struct NativeEngineTests {
+    enum Retirement: Sendable {
+        case stop
+        case gracefulStop
+        case reconnect
+    }
+
+    @Test
+    func `The original native initializer remains a callable factory`() {
+        let makeEngine = NativeEngine.init(certificatePinning:proxy:clientIdentity:)
+        let engine = makeEngine(nil, nil, nil)
+        engine.forceStop()
+    }
+
+    @Test
+    func `Each native connection applies its message limit before resume`() async throws {
+        let harness = NativeEngineHarness()
+        let engine = NativeEngine(
+            limits: WebSocketLimits(maximumMessageSize: 1_024),
+            dependencies: harness.dependencies
+        )
+        defer { engine.forceStop() }
+
+        engine.start(request: nativeTestRequest())
+        try await eventuallyNative { harness.resumedMessageLimits.count == 1 }
+        engine.start(request: nativeTestRequest(path: "reconnect"))
+        try await eventuallyNative { harness.resumedMessageLimits.count == 2 }
+
+        #expect(harness.resumedMessageLimits == [1_024, 1_024])
+    }
+
+    @Test
+    func `Repeated pinning results complete a server trust challenge once`() async throws {
+        let harness = NativeEngineHarness()
+        let pinner = PendingCertificatePinning()
+        let engine = NativeEngine(certificatePinning: pinner, dependencies: harness.dependencies)
+        engine.start(request: nativeTestRequest())
+        try await eventuallyNative { harness.connections.count == 1 }
+        let connection = try #require(harness.connections.first)
+        let challenge = try serverTrustChallenge()
+        let dispositions = Locked([URLSession.AuthChallengeDisposition]())
+
+        engine.urlSession(connection.session, didReceive: challenge) { disposition, credential in
+            #expect(credential != nil)
+            dispositions.withLock { $0.append(disposition) }
+        }
+        try await eventuallyNative { pinner.hasPendingEvaluation }
+        pinner.complete(.success)
+        pinner.complete(.failed(nil))
+
+        try await eventuallyNative { !dispositions.withLock { $0.isEmpty } }
+        await settleNative()
+        #expect(dispositions.withLock { $0 } == [.useCredential])
+        engine.forceStop()
+    }
+
+    @Test(arguments: [Retirement.stop, .gracefulStop, .reconnect])
+    func `Retiring a connection cancels pending authentication before pinning completes`(
+        retirement: Retirement
+    ) async throws {
+        let harness = NativeEngineHarness()
+        let pinner = PendingCertificatePinning()
+        let recorder = NativeEngineRecorder()
+        let engine = NativeEngine(certificatePinning: pinner, dependencies: harness.dependencies)
+        engine.register(delegate: recorder)
+        engine.start(request: nativeTestRequest())
+        try await eventuallyNative { harness.connections.count == 1 }
+        let connection = try #require(harness.connections.first)
+        let challenge = try serverTrustChallenge()
+        let dispositions = Locked([URLSession.AuthChallengeDisposition]())
+        engine.urlSession(connection.session, didReceive: challenge) { disposition, credential in
+            #expect(credential == nil)
+            dispositions.withLock { $0.append(disposition) }
+        }
+        try await eventuallyNative { pinner.hasPendingEvaluation }
+
+        switch retirement {
+        case .stop:
+            engine.forceStop()
+            try await eventuallyNative { recorder.events == [.cancelled] }
+        case .gracefulStop:
+            engine.stop(closeCode: CloseCode.normal.rawValue)
+            try await eventuallyNative { harness.requestedCloseCodes == [.normalClosure] }
+        case .reconnect:
+            engine.start(request: nativeTestRequest(path: "new"))
+            try await eventuallyNative { harness.connections.count == 2 }
+            let current = try #require(harness.connections.last)
+            engine.urlSession(current.session, webSocketTask: current.task, didOpenWithProtocol: "new")
+            try await eventuallyNative { recorder.events == [.connected("new")] }
+        }
+
+        try await eventuallyNative { dispositions.withLock { $0 } == [.cancelAuthenticationChallenge] }
+        #expect(dispositions.withLock { $0 } == [.cancelAuthenticationChallenge])
+        pinner.complete(.success)
+        pinner.complete(.failed(nil))
+        await settleNative()
+        #expect(dispositions.withLock { $0 } == [.cancelAuthenticationChallenge])
+        #expect(!recorder.events.contains(.error))
+        engine.forceStop()
+    }
+
     @Test
     func `Callbacks from a retired session cannot affect a reconnect`() async throws {
         let harness = NativeEngineHarness()
@@ -227,6 +328,7 @@ struct NativeEngineTests {
 
 private final class NativeEngineHarness: @unchecked Sendable {
     private let connectionStorage = Locked([NativeEngine.Connection]())
+    private let resumedMessageLimitStorage = Locked([Int]())
     private let requestedCloseCodeStorage = Locked([URLSessionWebSocketTask.CloseCode]())
     private let sendContinuations = Locked([CheckedContinuation<Void, Error>]())
     private let shouldSuspendSends: Bool
@@ -237,6 +339,10 @@ private final class NativeEngineHarness: @unchecked Sendable {
 
     var connections: [NativeEngine.Connection] {
         connectionStorage.withLock { $0 }
+    }
+
+    var resumedMessageLimits: [Int] {
+        resumedMessageLimitStorage.withLock { $0 }
     }
 
     var requestedCloseCodes: [URLSessionWebSocketTask.CloseCode] {
@@ -258,7 +364,9 @@ private final class NativeEngineHarness: @unchecked Sendable {
                 self?.connectionStorage.withLock { $0.append(connection) }
                 return connection
             },
-            resume: { _ in },
+            resume: { [weak self] task in
+                self?.resumedMessageLimitStorage.withLock { $0.append(task.maximumMessageSize) }
+            },
             cancel: { _ in },
             cancelWithCloseCode: { [weak self] _, closeCode in
                 self?.requestedCloseCodeStorage.withLock { $0.append(closeCode) }
@@ -325,6 +433,60 @@ private enum NativeEngineEvent: Equatable, Sendable {
 }
 
 private struct NativeEngineTestError: Error, Sendable {}
+
+private final class PendingCertificatePinning: CertificatePinning, Sendable {
+    private let completion = Locked<(@Sendable (PinningState) -> Void)?>(nil)
+
+    var hasPendingEvaluation: Bool { completion.withLock { $0 != nil } }
+
+    func evaluateTrust(
+        trust: SecTrust,
+        domain: String?,
+        completion: @escaping @Sendable (PinningState) -> Void
+    ) {
+        self.completion.withLock { $0 = completion }
+    }
+
+    func complete(_ state: PinningState) {
+        completion.withLock { $0 }?(state)
+    }
+}
+
+private final class ServerTrustProtectionSpace: URLProtectionSpace, @unchecked Sendable {
+    private let trust: SecTrust
+
+    init(trust: SecTrust) {
+        self.trust = trust
+        super.init(
+            host: "example.com",
+            port: 443,
+            protocol: "https",
+            realm: nil,
+            authenticationMethod: NSURLAuthenticationMethodServerTrust
+        )
+    }
+
+    required init?(coder: NSCoder) { return nil }
+
+    override var serverTrust: SecTrust? { trust }
+}
+
+private final class ChallengeSender: NSObject, URLAuthenticationChallengeSender {
+    func use(_ credential: URLCredential, for challenge: URLAuthenticationChallenge) {}
+    func continueWithoutCredential(for challenge: URLAuthenticationChallenge) {}
+    func cancel(_ challenge: URLAuthenticationChallenge) {}
+}
+
+private func serverTrustChallenge() throws -> URLAuthenticationChallenge {
+    URLAuthenticationChallenge(
+        protectionSpace: ServerTrustProtectionSpace(trust: try TestCertificate.makeTrust(domain: "example.com")),
+        proposedCredential: nil,
+        previousFailureCount: 0,
+        failureResponse: nil,
+        error: nil,
+        sender: ChallengeSender()
+    )
+}
 
 private func nativeTestRequest(path: String = "socket") -> URLRequest {
     URLRequest(url: URL(string: "ws://example.com/\(path)")!)

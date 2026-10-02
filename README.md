@@ -256,7 +256,7 @@ Compression can expose secrets through compressed-size side channels when attack
 
 ## Resource limits
 
-The custom engine defaults to 16 MiB per frame and 64 MiB per reassembled or decompressed message. Oversized peer input closes the connection with code `1009`. Use the same limits for framing and compression when an application needs a different policy:
+The custom engine defaults to 16 MiB per frame and 64 MiB per reassembled or decompressed message. Oversized peer input closes the connection with code `1009`. Configure built-in framing and optional compression with one policy:
 
 ```swift
 let limits = WebSocketLimits(
@@ -266,17 +266,28 @@ let limits = WebSocketLimits(
 )
 let engine = WSEngine(
     transport: TCPTransport(),
-    framer: WSFramer(limits: limits),
-    compressionHandler: WSCompression(limits: limits)
+    limits: limits,
+    compressionEnabled: true
 )
 let socket = WebSocket(request: request, engine: engine)
 ```
 
-`URLSessionWebSocketTask` enforces the native engine's platform-managed limits; use the custom engine when the application requires Starscream's explicit values.
+The initializer leaves compression disabled unless `compressionEnabled` is `true`. The existing initializer still accepts custom framing and compression handlers; configure their limits explicitly when using those handlers.
+
+The native engine applies `limits.maximumMessageSize` to each `URLSessionWebSocketTask` before it starts, including after a reconnect. Its default message limit is also 64 MiB:
+
+```swift
+let engine = NativeEngine(limits: limits)
+let socket = WebSocket(request: request, engine: engine)
+```
+
+URLSession counts the combined payload of continuation frames against this limit. Frame and decompression limits remain specific to the custom engine; the native engine does not apply those two fields.
 
 ## Callback queues and concurrency
 
 Starscream is built in Swift 6 language mode with Complete strict-concurrency checking. Connection and transport state are serialized internally. The API remains callback-based, and events are delivered on `DispatchQueue.main` by default.
+
+`FoundationSecurity` evaluates enabled trust policies asynchronously on a private queue. Its completion does not use the socket's callback queue. Do not change the supplied `SecTrust` until evaluation completes. The explicitly disabled policy can complete synchronously. Native authentication completes once even if a custom pinner calls back repeatedly; stopping or replacing the connection cancels pending authentication without waiting for that pinner.
 
 Choose a dedicated callback queue when event processing should not run on the main queue:
 

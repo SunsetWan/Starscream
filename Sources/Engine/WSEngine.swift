@@ -131,7 +131,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     private let compressionHandler: (any CompressionHandler)?
     private let certPinner: (any CertificatePinning)?
     private let headerChecker: any HeaderValidator
-    private let frameHandler = FrameCollector()
+    // Each frame carries the framer's message policy, including limits above the default.
+    private let frameHandler = FrameCollector(maximumMessageSize: .max)
     private let eventQueue = DispatchQueue(label: "com.vluxe.starscream.engine")
     private let queueKey = DispatchSpecificKey<UInt8>()
     private let closeTimeout: TimeInterval
@@ -140,6 +141,21 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     public var respondToPingWithPong: Bool {
         get { syncOnEventQueue { state.respondToPingWithPong } }
         set { performOnEventQueue { self.state.respondToPingWithPong = newValue } }
+    }
+
+    /// Configures built-in framing and optional compression with one resource policy.
+    public convenience init(
+        transport: any Transport,
+        certPinner: (any CertificatePinning)? = nil,
+        limits: WebSocketLimits,
+        compressionEnabled: Bool = false
+    ) {
+        self.init(
+            transport: transport,
+            certPinner: certPinner,
+            framer: WSFramer(limits: limits),
+            compressionHandler: compressionEnabled ? WSCompression(limits: limits) : nil
+        )
     }
 
     public convenience init(

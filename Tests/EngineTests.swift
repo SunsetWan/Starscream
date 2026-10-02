@@ -32,6 +32,101 @@ struct WSEngineTests {
     ]
 
     @Test
+    func `A configured message limit above the default survives fragment collection`() async throws {
+        let transport = EngineTestTransport()
+        let recorder = EngineEventRecorder()
+        let limits = WebSocketLimits(maximumMessageSize: 96 * 1024 * 1024)
+        let engine = WSEngine(transport: transport, framer: WSFramer(limits: limits))
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+
+        var first = serverFrame(opcode: .binaryFrame, payload: Data(repeating: 0x2A, count: 4 * 1024 * 1024))
+        first[0] = 0x02
+        var continuation = first
+        continuation[0] = 0x00
+        var last = first
+        last[0] = 0x80
+        transport.emit(.receive(first))
+        for _ in 0..<15 {
+            transport.emit(.receive(continuation))
+        }
+        transport.emit(.receive(last))
+
+        try await eventually(timeout: 10) { recorder.events.count > 1 }
+        #expect(recorder.events == [.connected, .binary(68 * 1024 * 1024)])
+    }
+
+    @Test(arguments: [4, 5])
+    func `Engine limits also bound negotiated decompression`(maximumSize: Int) async throws {
+        let transport = EngineTestTransport()
+        let recorder = EngineEventRecorder()
+        let limits = WebSocketLimits(
+            maximumFrameSize: 32,
+            maximumMessageSize: 32,
+            maximumDecompressedMessageSize: maximumSize
+        )
+        let engine = WSEngine(transport: transport, limits: limits, compressionEnabled: true)
+        try await openEngine(
+            engine,
+            transport: transport,
+            recorder: recorder,
+            extensionSelection: "permessage-deflate"
+        )
+        defer { engine.forceStop() }
+
+        // A final text frame containing the raw DEFLATE encoding of "Hello".
+        transport.emit(.receive(Data([0xC1, 0x07, 0xF2, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00])))
+
+        try await eventually { recorder.events.count > 1 }
+        if maximumSize == 4 {
+            #expect(recorder.events == [.connected, .error])
+            #expect(recorder.errorCodes == [CloseCode.messageTooBig.rawValue])
+        } else {
+            #expect(recorder.events == [.connected, .text("Hello")])
+            #expect(recorder.errorCodes.isEmpty)
+        }
+    }
+
+    @Test
+    func `Engine message limits count fragments and reset for each message`() async throws {
+        let transport = EngineTestTransport()
+        let recorder = EngineEventRecorder()
+        let engine = WSEngine(
+            transport: transport,
+            limits: WebSocketLimits(maximumFrameSize: 4, maximumMessageSize: 4)
+        )
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+
+        for _ in 0..<2 {
+            transport.emit(.receive(Data([0x01, 0x02, 0x31, 0x32])))
+            transport.emit(.receive(Data([0x80, 0x02, 0x33, 0x34])))
+        }
+        try await eventually { recorder.events.count == 3 }
+        #expect(recorder.events == [.connected, .text("1234"), .text("1234")])
+
+        transport.emit(.receive(Data([0x01, 0x02, 0x31, 0x32])))
+        transport.emit(.receive(Data([0x80, 0x03, 0x33, 0x34, 0x35])))
+        try await eventually { recorder.events.contains(.error) }
+        #expect(recorder.events == [.connected, .text("1234"), .text("1234"), .error])
+        #expect(recorder.errorCodes == [CloseCode.messageTooBig.rawValue])
+    }
+
+    @Test
+    func `Engine frame limit rejects an oversized header before its payload arrives`() async throws {
+        let transport = EngineTestTransport()
+        let recorder = EngineEventRecorder()
+        let engine = WSEngine(transport: transport, limits: WebSocketLimits(maximumFrameSize: 4))
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+
+        transport.emit(.receive(Data([0x82, 0x05])))
+
+        try await eventually { recorder.events.contains(.error) }
+        #expect(recorder.errorCodes == [CloseCode.messageTooBig.rawValue])
+    }
+
+    @Test
     func `Write before open completes exactly once without writing a frame`() async throws {
         let fixture = ControlledEngineFixture()
         let completionCount = Locked(0)
@@ -715,15 +810,21 @@ private final class AcceptingHeaderValidator: HeaderValidator, Sendable {
 
 private final class EngineEventRecorder: EngineDelegate, @unchecked Sendable {
     private let storage = Locked([EngineEventSnapshot]())
+    private let errorStorage = Locked([UInt16]())
 
     var events: [EngineEventSnapshot] { storage.withLock { $0 } }
+    var errorCodes: [UInt16] { errorStorage.withLock { $0 } }
 
     func didReceive(event: WebSocketEvent) {
+        if case .error(let error) = event, let error = error as? WSError {
+            errorStorage.withLock { $0.append(error.code) }
+        }
         storage.withLock { $0.append(EngineEventSnapshot(event)) }
     }
 
     func clear() {
         storage.withLock { $0.removeAll() }
+        errorStorage.withLock { $0.removeAll() }
     }
 }
 
@@ -731,6 +832,7 @@ private enum EngineEventSnapshot: Sendable, Equatable {
     case connected
     case disconnected(String, UInt16)
     case text(String)
+    case binary(Int)
     case error
     case cancelled
     case peerClosed
@@ -744,13 +846,15 @@ private enum EngineEventSnapshot: Sendable, Equatable {
             self = .disconnected(reason, code)
         case .text(let string):
             self = .text(string)
+        case .binary(let data):
+            self = .binary(data.count)
         case .error:
             self = .error
         case .cancelled:
             self = .cancelled
         case .peerClosed:
             self = .peerClosed
-        case .binary, .pong, .ping, .viabilityChanged, .reconnectSuggested:
+        case .pong, .ping, .viabilityChanged, .reconnectSuggested:
             self = .other
         }
     }
@@ -821,6 +925,26 @@ private extension WebSocketEvent {
 // MARK: - Test data and async polling
 
 private let testRequest = URLRequest(url: URL(string: "ws://example.com/socket")!)
+
+private func openEngine(
+    _ engine: WSEngine,
+    transport: EngineTestTransport,
+    recorder: EngineEventRecorder,
+    extensionSelection: String? = nil
+) async throws {
+    engine.register(delegate: recorder)
+    engine.start(request: testRequest)
+    try await eventually { transport.connectCount == 1 }
+    transport.emit(.connected)
+    try await eventually { transport.writes.count == 1 }
+    let request = try #require(String(data: transport.writes[0], encoding: .utf8))
+    let key = try #require(httpHeader(named: "Sec-WebSocket-Key", in: request))
+    let headers = validResponseHeaders(key: key, extensionSelection: extensionSelection)
+    let response = "HTTP/1.1 101 Switching Protocols\r\n"
+        + headers.map { "\($0.key): \($0.value)\r\n" }.joined() + "\r\n"
+    transport.emit(.receive(Data(response.utf8)))
+    try await eventually { recorder.events == [.connected] }
+}
 
 private func validResponseHeaders(
     key: String,

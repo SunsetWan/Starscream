@@ -1,5 +1,5 @@
 import Foundation
-import Security
+@preconcurrency import Security
 import Testing
 @testable import Starscream
 
@@ -45,37 +45,56 @@ struct SecurityTests {
     }
 
     @Test
-    func `System trust accepts a matching anchored certificate`() throws {
-        let trust = try makeTrust(domain: "example.com")
+    func `Trust evaluation leaves the caller queue available during completion`() async throws {
+        let trust = try TestCertificate.makeTrust(domain: "example.com")
+        let callerQueue = DispatchQueue(label: "security-test.caller")
+        let returned = DispatchSemaphore(value: 0)
 
-        #expect(isSuccess(evaluate(.system, trust: trust, domain: "example.com")))
+        let callerWasAvailable = await withCheckedContinuation { continuation in
+            callerQueue.async {
+                FoundationSecurity().evaluateTrust(trust: trust, domain: "example.com") { state in
+                    #expect(isSuccess(state))
+                    continuation.resume(returning: returned.wait(timeout: .now() + 2) == .success)
+                }
+                returned.signal()
+            }
+        }
+
+        #expect(callerWasAvailable)
     }
 
     @Test
-    func `System trust rejects a hostname mismatch`() throws {
-        let trust = try makeTrust(domain: "not-example.com")
+    func `System trust accepts a matching anchored certificate`() async throws {
+        let trust = try TestCertificate.makeTrust(domain: "example.com")
 
-        #expect(!isSuccess(evaluate(.system, trust: trust, domain: "not-example.com")))
+        #expect(isSuccess(await evaluate(.system, trust: trust, domain: "example.com")))
     }
 
     @Test
-    func `Disabled policy explicitly bypasses a hostname mismatch`() throws {
-        let trust = try makeTrust(domain: "not-example.com")
+    func `System trust rejects a hostname mismatch`() async throws {
+        let trust = try TestCertificate.makeTrust(domain: "not-example.com")
 
-        #expect(isSuccess(evaluate(.disabled, trust: trust, domain: "not-example.com")))
+        #expect(!isSuccess(await evaluate(.system, trust: trust, domain: "not-example.com")))
     }
 
     @Test
-    func `Certificate pinning accepts the anchored leaf and rejects another pin`() throws {
-        let matchingTrust = try makeTrust(domain: "example.com")
-        #expect(isSuccess(evaluate(
-            .certificates([Self.certificateData]),
+    func `Disabled policy explicitly bypasses a hostname mismatch`() async throws {
+        let trust = try TestCertificate.makeTrust(domain: "not-example.com")
+
+        #expect(isSuccess(await evaluate(.disabled, trust: trust, domain: "not-example.com")))
+    }
+
+    @Test
+    func `Certificate pinning accepts the anchored leaf and rejects another pin`() async throws {
+        let matchingTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(isSuccess(await evaluate(
+            .certificates([TestCertificate.data]),
             trust: matchingTrust,
             domain: "example.com"
         )))
 
-        let mismatchingTrust = try makeTrust(domain: "example.com")
-        #expect(!isSuccess(evaluate(
+        let mismatchingTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(!isSuccess(await evaluate(
             .certificates([Data("different certificate".utf8)]),
             trust: mismatchingTrust,
             domain: "example.com"
@@ -83,17 +102,17 @@ struct SecurityTests {
     }
 
     @Test
-    func `Public key pinning accepts the anchored leaf and rejects another key`() throws {
-        let publicKey = try FoundationSecurity.publicKeyData(from: Self.certificateData)
-        let matchingTrust = try makeTrust(domain: "example.com")
-        #expect(isSuccess(evaluate(
+    func `Public key pinning accepts the anchored leaf and rejects another key`() async throws {
+        let publicKey = try FoundationSecurity.publicKeyData(from: TestCertificate.data)
+        let matchingTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(isSuccess(await evaluate(
             .publicKeys([publicKey]),
             trust: matchingTrust,
             domain: "example.com"
         )))
 
-        let mismatchingTrust = try makeTrust(domain: "example.com")
-        #expect(!isSuccess(evaluate(
+        let mismatchingTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(!isSuccess(await evaluate(
             .publicKeys([Data("different key".utf8)]),
             trust: mismatchingTrust,
             domain: "example.com"
@@ -101,28 +120,47 @@ struct SecurityTests {
     }
 
     @Test
-    func `Empty pin sets fail closed`() throws {
-        let certificateTrust = try makeTrust(domain: "example.com")
-        #expect(!isSuccess(evaluate(
+    func `Empty pin sets fail closed`() async throws {
+        let certificateTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(!isSuccess(await evaluate(
             .certificates([]),
             trust: certificateTrust,
             domain: "example.com"
         )))
 
-        let publicKeyTrust = try makeTrust(domain: "example.com")
-        #expect(!isSuccess(evaluate(
+        let publicKeyTrust = try TestCertificate.makeTrust(domain: "example.com")
+        #expect(!isSuccess(await evaluate(
             .publicKeys([]),
             trust: publicKeyTrust,
             domain: "example.com"
         )))
     }
 
-    private static let certificateData = Data(base64Encoded: "MIIDSTCCAjGgAwIBAgIUPqODNe4QnKN2Tnf/VSNgm1GC8bcwDQYJKoZIhvcNAQELBQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wHhcNMjYwODEyMTgyMTM4WhcNMjcwNjA4MTgyMTM4WjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOUWxjTIe4u9Kh0pVBdVBECn926wvV9HmPGtV4ggXLRfEwDUwDR57uEw2XWRWbfIAIAknUbGh2p2MtWgc8Q1oJGRgGtykNRvUj0kBo22E0hdO2NSMQVnP9ewulH+6dnV9Pl8hZrcvbS1lEbTlwsOs+tkZ00cuk89FPm00k6AjUAAVtjOy1/YbVKyCojAMP+d+hHER9c8CkW3700/bgIoOQPJklOh0EPz/PCXul4CdgAPXdyWsoVpVRCb3tmjkJT2CiGVLQ+cDohJFY1y+4aaD23lyBt5ETwi8ru2f19J186Qol5++fkJ9JrmPM9lyTb3C5kgoeff1+2PoV4Bi2bqI00CAwEAAaOBjjCBizAdBgNVHQ4EFgQUMZYZcdU1usJQy+IEEM5iqvy/DCQwHwYDVR0jBBgwFoAUMZYZcdU1usJQy+IEEM5iqvy/DCQwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAH2htIMc+AzdDH5ZS6dSVsVzgXMMTG4K0RuMhKBM4E4ArX40EnG6T6N+gdcuozuXFRmtqCz+4xWZ4WEbTDZ+CtFaXhb13qnZtO1kV4Q8Tc/701fnP3wI1tm1CMKLYcgaclUATArfnWry0W2m6VWgpuZCOQj0csbfkiEjQjY6TggJ67kXqKT8M2OAwdXG2tQXXePHpuCJNnkyUg56MjzJFJN6csLXRIKNhWx8fEgnCs9aCEi/4NTyp8l2spMIPCt6Cuztl49p7cEQrq9rYZxqjaTpfqzBZqspoHSXx1gIiTDqAJI33olKSNnrUHp8LvjKhBG3fWQbyqr9qGIR0j/TF6w=")!
+    private func evaluate(
+        _ policy: CertificatePinningPolicy,
+        trust: SecTrust,
+        domain: String
+    ) async -> PinningState {
+        await withCheckedContinuation { continuation in
+            FoundationSecurity(policy: policy).evaluateTrust(trust: trust, domain: domain) { state in
+                continuation.resume(returning: state)
+            }
+        }
+    }
 
-    private func makeTrust(domain: String) throws -> SecTrust {
+    private func isSuccess(_ state: PinningState) -> Bool {
+        if case .success = state { return true }
+        return false
+    }
+}
+
+enum TestCertificate {
+    static let data = Data(base64Encoded: "MIIDSTCCAjGgAwIBAgIUPqODNe4QnKN2Tnf/VSNgm1GC8bcwDQYJKoZIhvcNAQELBQAwFjEUMBIGA1UEAwwLZXhhbXBsZS5jb20wHhcNMjYwODEyMTgyMTM4WhcNMjcwNjA4MTgyMTM4WjAWMRQwEgYDVQQDDAtleGFtcGxlLmNvbTCCASIwDQYJKoZIhvcNAQEBBQADggEPADCCAQoCggEBAOUWxjTIe4u9Kh0pVBdVBECn926wvV9HmPGtV4ggXLRfEwDUwDR57uEw2XWRWbfIAIAknUbGh2p2MtWgc8Q1oJGRgGtykNRvUj0kBo22E0hdO2NSMQVnP9ewulH+6dnV9Pl8hZrcvbS1lEbTlwsOs+tkZ00cuk89FPm00k6AjUAAVtjOy1/YbVKyCojAMP+d+hHER9c8CkW3700/bgIoOQPJklOh0EPz/PCXul4CdgAPXdyWsoVpVRCb3tmjkJT2CiGVLQ+cDohJFY1y+4aaD23lyBt5ETwi8ru2f19J186Qol5++fkJ9JrmPM9lyTb3C5kgoeff1+2PoV4Bi2bqI00CAwEAAaOBjjCBizAdBgNVHQ4EFgQUMZYZcdU1usJQy+IEEM5iqvy/DCQwHwYDVR0jBBgwFoAUMZYZcdU1usJQy+IEEM5iqvy/DCQwFgYDVR0RBA8wDYILZXhhbXBsZS5jb20wDAYDVR0TAQH/BAIwADAOBgNVHQ8BAf8EBAMCBaAwEwYDVR0lBAwwCgYIKwYBBQUHAwEwDQYJKoZIhvcNAQELBQADggEBAH2htIMc+AzdDH5ZS6dSVsVzgXMMTG4K0RuMhKBM4E4ArX40EnG6T6N+gdcuozuXFRmtqCz+4xWZ4WEbTDZ+CtFaXhb13qnZtO1kV4Q8Tc/701fnP3wI1tm1CMKLYcgaclUATArfnWry0W2m6VWgpuZCOQj0csbfkiEjQjY6TggJ67kXqKT8M2OAwdXG2tQXXePHpuCJNnkyUg56MjzJFJN6csLXRIKNhWx8fEgnCs9aCEi/4NTyp8l2spMIPCt6Cuztl49p7cEQrq9rYZxqjaTpfqzBZqspoHSXx1gIiTDqAJI33olKSNnrUHp8LvjKhBG3fWQbyqr9qGIR0j/TF6w=")!
+
+    static func makeTrust(domain: String) throws -> SecTrust {
         let certificate = try #require(SecCertificateCreateWithData(
             nil,
-            Self.certificateData as CFData
+            data as CFData
         ))
         var optionalTrust: SecTrust?
         let status = SecTrustCreateWithCertificates(
@@ -138,22 +176,5 @@ struct SecurityTests {
         let verificationDate = Date(timeIntervalSince1970: 1_788_192_000) as CFDate
         #expect(SecTrustSetVerifyDate(trust, verificationDate) == errSecSuccess)
         return trust
-    }
-
-    private func evaluate(
-        _ policy: CertificatePinningPolicy,
-        trust: SecTrust,
-        domain: String
-    ) -> PinningState {
-        let result = Locked<PinningState?>(nil)
-        FoundationSecurity(policy: policy).evaluateTrust(trust: trust, domain: domain) { state in
-            result.withLock { $0 = state }
-        }
-        return result.withLock { $0 }!
-    }
-
-    private func isSuccess(_ state: PinningState) -> Bool {
-        if case .success = state { return true }
-        return false
     }
 }

@@ -22,7 +22,7 @@
 
 import Foundation
 import CryptoKit
-import Security
+@preconcurrency import Security
 
 public enum FoundationSecurityError: Error, Sendable, Equatable {
     case invalidRequest
@@ -35,6 +35,7 @@ public enum FoundationSecurityError: Error, Sendable, Equatable {
 
 public final class FoundationSecurity: Sendable {
     public let policy: CertificatePinningPolicy
+    private let evaluationQueue = DispatchQueue(label: "com.vluxe.starscream.trust-evaluation")
 
     /// Compatibility initializer. Prefer `init(policy:)` for new code.
     public init(allowSelfSigned: Bool = false) {
@@ -74,6 +75,7 @@ public final class FoundationSecurity: Sendable {
 }
 
 extension FoundationSecurity: CertificatePinning {
+    /// Evaluates enabled policies on a private queue. Do not change `trust` until completion.
     public func evaluateTrust(
         trust: SecTrust,
         domain: String?,
@@ -84,34 +86,48 @@ extension FoundationSecurity: CertificatePinning {
             return
         }
 
-        SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, domain as CFString?))
-        var trustError: CFError?
-        guard SecTrustEvaluateWithError(trust, &trustError) else {
-            completion(.failed(trustError))
-            return
-        }
-
-        switch policy {
-        case .system, .disabled:
-            completion(.success)
-        case .certificates(let pins):
-            guard !pins.isEmpty else {
-                completion(.failed(FoundationSecurityError.emptyPinSet))
+        evaluationQueue.async {
+            let policyStatus = SecTrustSetPolicies(trust, SecPolicyCreateSSL(true, domain as CFString?))
+            guard policyStatus == errSecSuccess else {
+                completion(.failed(NSError(domain: NSOSStatusErrorDomain, code: Int(policyStatus))))
                 return
             }
+
+            // Security requires this call and its callback to use the same queue.
+            let status = SecTrustEvaluateAsyncWithError(trust, self.evaluationQueue) { trust, trusted, error in
+                guard trusted else {
+                    completion(.failed(error))
+                    return
+                }
+                completion(self.checkPins(trust))
+            }
+            // A non-success status means Security will not call the callback.
+            if status != errSecSuccess {
+                completion(.failed(NSError(domain: NSOSStatusErrorDomain, code: Int(status))))
+            }
+        }
+    }
+
+    private func checkPins(_ trust: SecTrust) -> PinningState {
+        switch policy {
+        case .system, .disabled:
+            return .success
+        case .certificates(let pins):
+            guard !pins.isEmpty else {
+                return .failed(FoundationSecurityError.emptyPinSet)
+            }
             let chainData = certificateChain(trust).map { SecCertificateCopyData($0) as Data }
-            completion(chainData.contains(where: pins.contains) ? .success : .failed(FoundationSecurityError.certificatePinMismatch))
+            return chainData.contains(where: pins.contains) ? .success : .failed(FoundationSecurityError.certificatePinMismatch)
         case .publicKeys(let pins):
             guard !pins.isEmpty else {
-                completion(.failed(FoundationSecurityError.emptyPinSet))
-                return
+                return .failed(FoundationSecurityError.emptyPinSet)
             }
             let keyData = certificateChain(trust).compactMap { certificate -> Data? in
                 guard let key = SecCertificateCopyKey(certificate) else { return nil }
                 var error: Unmanaged<CFError>?
                 return SecKeyCopyExternalRepresentation(key, &error) as Data?
             }
-            completion(keyData.contains(where: pins.contains) ? .success : .failed(FoundationSecurityError.publicKeyPinMismatch))
+            return keyData.contains(where: pins.contains) ? .success : .failed(FoundationSecurityError.publicKeyPinMismatch)
         }
     }
 
