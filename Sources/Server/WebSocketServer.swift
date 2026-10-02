@@ -143,6 +143,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     private let outputQueue: DispatchQueue
     private let id: String
     private let closeTimeout: TimeInterval
+    private let timeoutScheduler: @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
 
     public var onEvent: ((ConnectionEvent) -> Void)? {
         get { state.withLock { $0.onEvent } }
@@ -160,7 +161,10 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         transport: any Transport,
         httpHandler: any HTTPServerHandler = FoundationHTTPServerHandler(),
         framer: any Framer = WSFramer(isServer: true),
-        closeTimeout: TimeInterval = 5
+        closeTimeout: TimeInterval = 5,
+        timeoutScheduler: @escaping @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void = { interval, queue, action in
+            queue.asyncAfter(deadline: .now() + interval, execute: action)
+        }
     ) {
         let id = UUID().uuidString
         self.id = id
@@ -168,6 +172,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         self.httpHandler = httpHandler
         self.framer = framer
         self.closeTimeout = max(0, closeTimeout)
+        self.timeoutScheduler = timeoutScheduler
         inputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.input.\(id)")
         outputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.output.\(id)")
 
@@ -554,7 +559,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     }
 
     private func scheduleCloseTimeout(generation: UInt64) {
-        inputQueue.asyncAfter(deadline: .now() + closeTimeout) { [weak self] in
+        timeoutScheduler(closeTimeout, inputQueue) { [weak self] in
             guard let self else { return }
             let context = self.state.withLock { state -> CloseContext? in
                 guard state.phase == .closing, state.closeGeneration == generation else { return nil }

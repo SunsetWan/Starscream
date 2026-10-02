@@ -317,7 +317,8 @@ struct ServerConnectionTests {
     @Test
     func `Application close waits for peer close and sends only one close frame`() async throws {
         let transport = ServerTestTransport()
-        let connection = ServerConnection(transport: transport, closeTimeout: 1)
+        let timeouts = TestTimeoutScheduler()
+        let connection = ServerConnection(transport: transport, timeoutScheduler: timeouts.schedule)
         try await open(connection, transport: transport)
         let payload = makeClosePayload(code: CloseCode.normal.rawValue, reason: Data("bye".utf8))
 
@@ -328,7 +329,7 @@ struct ServerConnectionTests {
                     confirm()
                 }
             } isComplete: {
-                transport.writes.count == 2
+                transport.writes.count == 2 && timeouts.count == 1
             }
         }
         #expect(transport.disconnectCount == 0)
@@ -347,16 +348,19 @@ struct ServerConnectionTests {
         }
 
         #expect(transport.writes.count == 2, "The peer close must not trigger a second close frame")
+        try timeouts.fireNext()
+        #expect(transport.disconnectCount == 1)
     }
 
     @Test
     func `Application close disconnects after its timeout`() async throws {
         let transport = ServerTestTransport()
-        let connection = ServerConnection(transport: transport, closeTimeout: 0.02)
+        let timeouts = TestTimeoutScheduler()
+        let connection = ServerConnection(transport: transport, timeoutScheduler: timeouts.schedule)
         try await open(connection, transport: transport)
         let payload = makeClosePayload(code: CloseCode.goingAway.rawValue, reason: Data())
 
-        await confirmation("timeout disconnect") { confirm in
+        try await confirmation("timeout disconnect") { confirm in
             await withEventPump {
                 connection.onEvent = { event in
                     guard case .disconnected(let reason, let code) = event else { return }
@@ -368,9 +372,12 @@ struct ServerConnectionTests {
                     #expect(error == nil)
                 }
             } isComplete: {
-                transport.disconnectCount == 1
+                timeouts.count == 1
             }
+            #expect(transport.disconnectCount == 0)
+            try timeouts.fireNext()
         }
+        #expect(transport.disconnectCount == 1)
         #expect(transport.writes.count == 2)
     }
 

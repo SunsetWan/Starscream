@@ -49,6 +49,7 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate, @unchecke
     private let lifecycleLock = NSRecursiveLock()
     private let workQueue = DispatchQueue(label: "com.vluxe.starscream.websocket", attributes: [])
     private let onConnect: (@Sendable (InputStream, OutputStream) -> Void)?
+    private let timeoutScheduler: @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
     
     public var usingTLS: Bool {
         state.withLock { $0.isTLS }
@@ -56,6 +57,18 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate, @unchecke
     
     public init(streamConfiguration: (@Sendable (InputStream, OutputStream) -> Void)? = nil) {
         onConnect = streamConfiguration
+        timeoutScheduler = { interval, queue, action in
+            queue.asyncAfter(deadline: .now() + interval, execute: action)
+        }
+        super.init()
+    }
+
+    init(
+        streamConfiguration: (@Sendable (InputStream, OutputStream) -> Void)? = nil,
+        timeoutScheduler: @escaping @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
+    ) {
+        onConnect = streamConfiguration
+        self.timeoutScheduler = timeoutScheduler
         super.init()
     }
     
@@ -114,7 +127,7 @@ public class FoundationTransport: NSObject, Transport, StreamDelegate, @unchecke
             outputStream.open()
 
             let generation = installation.generation
-            workQueue.asyncAfter(deadline: .now() + timeout) { [weak self] in
+            timeoutScheduler(timeout, workQueue) { [weak self] in
                 self?.handleTimeout(generation: generation)
             }
         }

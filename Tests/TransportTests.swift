@@ -162,12 +162,28 @@ struct TransportGenerationTests {
     }
 
     @Test
-    func `Foundation timeout from an old connection cannot fail its replacement`() async throws {
+    func `Foundation timeout from an old connection cannot fail its replacement`() throws {
         let capturedInputs = Locked<[InputStream]>([])
         let recorder = TransportEventRecorder()
-        let transport = FoundationTransport { inputStream, _ in
-            capturedInputs.withLock { $0.append(inputStream) }
-        }
+        let pendingTimeout = Locked<(@Sendable () -> Void)?>(nil)
+        let transport = FoundationTransport(
+            streamConfiguration: { inputStream, _ in
+                capturedInputs.withLock { $0.append(inputStream) }
+            },
+            timeoutScheduler: { _, _, timeout in
+                let previousTimeout = pendingTimeout.withLock { pending in
+                    defer { pending = timeout }
+                    return pending
+                }
+                guard let previousTimeout else { return }
+                // Run both deadlines while connect holds its lifecycle lock so stream errors
+                // cannot race the timeout assertions.
+                previousTimeout()
+                #expect(!recorder.events.contains(.timedOut))
+                timeout()
+                timeout()
+            }
+        )
         transport.register(delegate: recorder)
 
         transport.connect(
@@ -178,17 +194,38 @@ struct TransportGenerationTests {
         let firstInput = try #require(capturedInputs.withLock { $0.first })
         transport.stream(firstInput, handle: .openCompleted)
 
+        recorder.removeAll()
         transport.connect(
             url: try #require(URL(string: "ws://192.0.2.1:65001")),
             timeout: 2,
             certificatePinning: nil
         )
-        recorder.removeAll()
-
-        try? await Task.sleep(nanoseconds: 250_000_000)
-
-        #expect(!recorder.events.contains(.timedOut))
+        #expect(recorder.events.filter { $0 == .timedOut }.count == 1)
         transport.disconnect()
+    }
+}
+
+final class TestTimeoutScheduler: Sendable {
+    private struct Timeout: Sendable {
+        let queue: DispatchQueue
+        let action: @Sendable () -> Void
+    }
+
+    private let pending = Locked<[Timeout]>([])
+
+    var count: Int {
+        pending.withLock { $0.count }
+    }
+
+    func schedule(after interval: TimeInterval, on queue: DispatchQueue, action: @escaping @Sendable () -> Void) {
+        pending.withLock { $0.append(Timeout(queue: queue, action: action)) }
+    }
+
+    func fireNext() throws {
+        let timeout = try #require(pending.withLock { pending in
+            pending.isEmpty ? nil : pending.removeFirst()
+        })
+        timeout.queue.sync(execute: timeout.action)
     }
 }
 
