@@ -35,6 +35,7 @@ public struct WebSocketLimits: Sendable, Equatable {
     /// A conservative default that still accommodates ordinary binary WebSocket traffic.
     public static let `default` = WebSocketLimits()
 
+    /// Data-frame payload limit. Control frames retain the RFC 6455 limit of 125 bytes.
     public let maximumFrameSize: Int
     public let maximumMessageSize: Int
     public let maximumDecompressedMessageSize: Int
@@ -314,7 +315,7 @@ public class WSFramer: Framer {
         guard dataLength <= UInt64(Int.max) else {
             return protocolFailure("payload length exceeds this platform's supported size")
         }
-        guard dataLength <= UInt64(limits.maximumFrameSize) else {
+        guard isControlFrame || dataLength <= UInt64(limits.maximumFrameSize) else {
             return messageTooBigFailure(
                 "frame payload exceeds the configured maximum of \(limits.maximumFrameSize) bytes"
             )
@@ -453,13 +454,15 @@ public class WSFramer: Framer {
                 code: CloseCode.messageTooBig.rawValue
             )
         }
-        let maximumPayloadSize = min(limits.maximumFrameSize, limits.maximumMessageSize)
-        guard payload.count <= maximumPayloadSize else {
-            return WSError(
-                type: .protocolError,
-                message: "payload exceeds the configured maximum of \(maximumPayloadSize) bytes",
-                code: CloseCode.messageTooBig.rawValue
-            )
+        if !opcode.isControlFrame {
+            let maximumPayloadSize = min(limits.maximumFrameSize, limits.maximumMessageSize)
+            guard payload.count <= maximumPayloadSize else {
+                return WSError(
+                    type: .protocolError,
+                    message: "payload exceeds the configured maximum of \(maximumPayloadSize) bytes",
+                    code: CloseCode.messageTooBig.rawValue
+                )
+            }
         }
         if isCompressed {
             guard compressionEnabled else {

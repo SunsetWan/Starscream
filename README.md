@@ -256,6 +256,8 @@ Compression can expose secrets through compressed-size side channels when attack
 
 ## Resource limits
 
+Frame and message limits apply to data payloads. Control frames keep their RFC limit of 125 bytes, so small data limits still permit ping, pong, and close handling.
+
 The custom engine defaults to 16 MiB per frame and 64 MiB per reassembled or decompressed message. Oversized peer input closes the connection with code `1009`. Configure built-in framing and optional compression with one policy:
 
 ```swift
