@@ -274,18 +274,25 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         case .cancelled:
             finishDisconnect(reason: "Connection cancelled", code: 1006)
         case .peerClosed:
-            framer.flush { [weak self] in
-                self?.inputQueue.async { [weak self] in
-                    self?.finishInput()
-                }
+            state.withLock { $0.inputClosed = true }
+            flushInput()
+        }
+    }
+
+    private func flushInput() {
+        // A pending upgrade owns bytes that have not reached the framer yet.
+        let canFinish = state.withLock { $0.phase != .upgrading }
+        framer.flush { [weak self] in
+            guard canFinish else { return }
+            self?.inputQueue.async { [weak self] in
+                self?.finishInput()
             }
         }
     }
 
     private func finishInput() {
         let context = state.withLock { state -> CloseContext? in
-            guard state.phase != .closed else { return nil }
-            state.inputClosed = true
+            guard state.phase != .closed, state.phase != .upgrading else { return nil }
             guard !state.closeWritePending else { return nil }
             return state.peerCloseContext ?? state.closeContext
                 ?? CloseContext(reason: "Connection closed by peer", code: 1006)
@@ -366,6 +373,9 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         emit(connectionEvent: .connected(headers), serverEvent: .connected(self, headers))
         if !pendingData.isEmpty {
             framer.add(data: pendingData)
+        }
+        if state.withLock({ $0.inputClosed }) {
+            flushInput()
         }
     }
 
@@ -612,7 +622,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                     } else if let peerClose {
                         self.finishDisconnect(reason: peerClose.reason, code: peerClose.code)
                     } else if self.state.withLock({ $0.inputClosed }) {
-                        self.finishInput()
+                        self.flushInput()
                     }
                 }
             }

@@ -14,6 +14,41 @@ import Testing
 
 @Suite("Server connection")
 struct ServerConnectionTests {
+    @Test
+    func `EOF during the upgrade write preserves buffered messages and close frames`() async throws {
+        let transport = ServerTestTransport()
+        transport.holdWriteCompletions = true
+        let flushed = Locked(false)
+        let framer = ServerFlushObserver { flushed.withLock { $0 = true } }
+        let connection = ServerConnection(transport: transport, framer: framer)
+        let events = Locked([String]())
+        connection.onEvent = { event in
+            switch event {
+            case .connected: events.withLock { $0.append("connected") }
+            case .text(let text): events.withLock { $0.append("text:\(text)") }
+            case .disconnected(_, let code): events.withLock { $0.append("disconnected:\(code)") }
+            case .error: events.withLock { $0.append("error") }
+            default: break
+            }
+        }
+        transport.receive(Data(validUpgradeRequest.utf8))
+        try await eventuallyForServer { transport.writes.count == 1 }
+        transport.receive(
+            clientFrame(opcode: .textFrame, payload: Data("last".utf8))
+                + clientFrame(opcode: .connectionClose, payload: Data([0x03, 0xE8]))
+        )
+        connection.connectionChanged(state: .peerClosed)
+        try await eventuallyForServer { flushed.withLock { $0 } }
+
+        transport.holdWriteCompletions = false
+        transport.completeNextWrite()
+        try await eventuallyForServer { events.withLock { $0.contains { $0.hasPrefix("disconnected:") } } }
+
+        #expect(events.withLock { $0 } == ["connected", "text:last", "disconnected:1000"])
+        #expect(transport.writes.last == Data([0x88, 0x02, 0x03, 0xE8]))
+        #expect(transport.disconnectCount == 1)
+    }
+
     @Test(arguments: [false, true])
     func `EOF preserves the last server message and waits for its close response`(holdCloseWrite: Bool) async throws {
         let transport = ServerTestTransport()
@@ -619,16 +654,15 @@ struct ServerConnectionTests {
         _ connection: ServerConnection,
         transport: ServerTestTransport
     ) async throws {
-        await confirmation("connected") { confirm in
-            await withEventPump {
-                connection.onEvent = { event in
-                    guard case .connected = event else { return }
-                    confirm()
-                }
-                transport.receive(Data(validUpgradeRequest.utf8))
-            } isComplete: {
-                transport.writes.count == 1
+        let connected = Locked(false)
+        try await confirmation("connected") { confirm in
+            connection.onEvent = { event in
+                guard case .connected = event else { return }
+                confirm()
+                connected.withLock { $0 = true }
             }
+            transport.receive(Data(validUpgradeRequest.utf8))
+            try await eventuallyForServer { connected.withLock { $0 } }
         }
         #expect(transport.writes.count == 1)
     }
@@ -790,6 +824,23 @@ private final class ServerCloseFrameRecorder: FramerEventClient, Sendable {
             self.frame.withLock { $0 = frame }
         }
         ready.signal()
+    }
+}
+
+private final class ServerFlushObserver: WSFramer {
+    private let didFlush: @Sendable () -> Void
+
+    init(didFlush: @escaping @Sendable () -> Void) {
+        self.didFlush = didFlush
+        super.init(isServer: true)
+    }
+
+    override func flush(completion: @escaping @Sendable () -> Void) {
+        let didFlush = self.didFlush
+        super.flush {
+            completion()
+            didFlush()
+        }
     }
 }
 
