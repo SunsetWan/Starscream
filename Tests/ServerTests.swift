@@ -13,6 +13,14 @@ import Testing
 @Suite("Server connection")
 struct ServerConnectionTests {
     @Test
+    func `Server callbacks can safely cross concurrency domains`() {
+        let connection = ServerConnection(transport: ServerTestTransport())
+        let server = WebSocketServer()
+        requireSendableServerCallback(connection.onEvent)
+        requireSendableServerCallback(server.onEvent)
+    }
+
+    @Test
     func `Upgrade response is complete and same-read leftover is processed`() async throws {
         let transport = ServerTestTransport()
         let connection = ServerConnection(transport: transport)
@@ -494,6 +502,8 @@ Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r
 Sec-WebSocket-Version: 13\r
 \r\n
 """
+
+private func requireSendableServerCallback<T: Sendable>(_: T) {}
 
 private func clientFrame(opcode: FrameOpCode, payload: Data) -> Data {
     try! WSFramer(isServer: false).createWriteFrameResult(

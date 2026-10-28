@@ -379,6 +379,7 @@ Starscream 5 is a major release because the package now builds in Swift 6 langua
 Applications with custom Starscream components also need these source changes:
 
 - Custom `Engine` implementations must conform to `Sendable`; completion handlers passed through engine and client write APIs are `@Sendable`.
+- Server and server-connection event closures are `@Sendable` and run on private serial queues. Use a task or dispatch queue to update UI state.
 - Custom `CertificatePinning` implementations must be `Sendable`, invoke an `@Sendable` completion, and handle `PinningState.failed` as an optional `Error`.
 - Custom `CompressionHandler` implementations must be reference types and `Sendable`. `load(headers:)` reports whether negotiation succeeded, `decompress(data:isFinal:)` throws on invalid input, and `reset()` clears connection-scoped state.
 - `WebSocket` is now a final, thread-safe facade. Put customization in an `Engine`, `Transport`, compression handler, certificate pinner, delegate, or event closure instead of subclassing it.

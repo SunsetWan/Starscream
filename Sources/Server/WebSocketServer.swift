@@ -39,14 +39,14 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
     private struct State {
         var connections = [String: ServerConnection]()
         var listener: NWListener?
-        var onEvent: ((ServerEvent) -> Void)?
+        var onEvent: (@Sendable (ServerEvent) -> Void)?
     }
 
     private let state = Locked(State())
     private let queue = DispatchQueue(label: "com.vluxe.starscream.server.networkstream")
     private let callbackQueue = DispatchQueue(label: "com.vluxe.starscream.server.callbacks")
 
-    public var onEvent: ((ServerEvent) -> Void)? {
+    public var onEvent: (@Sendable (ServerEvent) -> Void)? {
         get { state.withLock { $0.onEvent } }
         set { state.withLock { $0.onEvent = newValue } }
     }
@@ -131,7 +131,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         var closeContext: CloseContext?
         var closeGeneration: UInt64 = 0
         var delegate = WeakReference<any ConnectionDelegate>()
-        var onEvent: ((ConnectionEvent) -> Void)?
+        var onEvent: (@Sendable (ConnectionEvent) -> Void)?
     }
 
     let transport: any Transport
@@ -145,7 +145,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     private let closeTimeout: TimeInterval
     private let timeoutScheduler: @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
 
-    public var onEvent: ((ConnectionEvent) -> Void)? {
+    public var onEvent: (@Sendable (ConnectionEvent) -> Void)? {
         get { state.withLock { $0.onEvent } }
         set { state.withLock { $0.onEvent = newValue } }
     }
@@ -445,7 +445,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     }
 
     private func finishDisconnect(reason: String, code: UInt16) {
-        let callbacks = state.withLock { state -> (ConnectionDelegate?, ((ConnectionEvent) -> Void)?)? in
+        let callbacks = state.withLock { state -> (ConnectionDelegate?, (@Sendable (ConnectionEvent) -> Void)?)? in
             guard state.phase != .closed else { return nil }
             state.phase = .closed
             state.closeGeneration &+= 1
