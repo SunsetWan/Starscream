@@ -73,9 +73,7 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
                 networkConnection.cancel()
                 return
             }
-            let connection = ServerConnection(transport: TCPTransport(connection: networkConnection))
-            connection.delegate = self
-            self.register(connection)
+            self.accept(connection: networkConnection)
         }
         state.withLock { $0.listener = listener }
         listener.start(queue: queue)
@@ -96,6 +94,14 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
 
     func register(_ connection: ServerConnection) {
         state.withLock { $0.connections[connection.uuid] = connection }
+    }
+
+    func accept(connection networkConnection: NWConnection) {
+        let transport = TCPTransport()
+        let connection = ServerConnection(transport: transport)
+        connection.delegate = self
+        register(connection)
+        transport.accept(connection: networkConnection)
     }
 
     var connectionCount: Int {
@@ -145,6 +151,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     private let outputQueue: DispatchQueue
     private let id: String
     private let closeTimeout: TimeInterval
+    private let maximumPendingUpgradeBytes = WebSocketLimits.default.maximumFrameSize + MaxFrameSize
     private let timeoutScheduler: @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
 
     public var onEvent: (@Sendable (ConnectionEvent) -> Void)? {
@@ -178,10 +185,10 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         inputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.input.\(id)")
         outputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.output.\(id)")
 
-        transport.register(delegate: self)
         httpHandler.register(delegate: self)
         framer.register(delegate: self)
         frameHandler.delegate = self
+        transport.register(delegate: self)
     }
 
     public func write(data: Data, opcode: FrameOpCode) {
@@ -233,6 +240,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 case http
                 case frame
                 case buffered
+                case overflow
                 case ignored
             }
             let destination = state.withLock { state -> Destination in
@@ -240,7 +248,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 case .handshaking:
                     return .http
                 case .upgrading:
-                    state.pendingData.append(data)
+                    guard appendPendingUpgrade(data, to: &state) else { return .overflow }
                     return .buffered
                 case .open, .closing:
                     return .frame
@@ -253,6 +261,8 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 httpHandler.parse(data: data)
             case .frame:
                 framer.add(data: data)
+            case .overflow:
+                failPendingUpgrade()
             case .buffered, .ignored:
                 break
             }
@@ -273,13 +283,16 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     public func didReceive(event: HTTPEvent) {
         switch event {
         case .success(let headers, let leftover):
-            let shouldUpgrade = state.withLock { state -> Bool in
-                guard state.phase == .handshaking else { return false }
+            let canBuffer = state.withLock { state -> Bool? in
+                guard state.phase == .handshaking else { return nil }
                 state.phase = .upgrading
-                state.pendingData.append(leftover)
-                return true
+                return appendPendingUpgrade(leftover, to: &state)
             }
-            guard shouldUpgrade else { return }
+            guard let canBuffer else { return }
+            guard canBuffer else {
+                failPendingUpgrade()
+                return
+            }
 
             let response = httpHandler.createResponse(headers: [:])
             guard !response.isEmpty else {
@@ -307,6 +320,18 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 finishDisconnect(reason: "Invalid WebSocket upgrade request", code: 1006)
             }
         }
+    }
+
+    private func appendPendingUpgrade(_ data: Data, to state: inout State) -> Bool {
+        guard data.count <= maximumPendingUpgradeBytes - state.pendingData.count else { return false }
+        state.pendingData.append(data)
+        return true
+    }
+
+    private func failPendingUpgrade() {
+        let reason = "input buffered during the WebSocket upgrade exceeds its configured maximum"
+        emit(error: WSError(type: .protocolError, message: reason, code: CloseCode.messageTooBig.rawValue))
+        finishDisconnect(reason: reason, code: CloseCode.messageTooBig.rawValue)
     }
 
     private func finishUpgrade(headers: [String: String], error: Error?) {

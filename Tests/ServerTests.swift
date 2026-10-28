@@ -10,8 +10,68 @@ import Testing
 @testable import Starscream
 
 #if canImport(Network)
+@preconcurrency import Network
+
 @Suite("Server connection")
 struct ServerConnectionTests {
+    @Test
+    func `A pending upgrade accepts its exact buffer limit and preserves frame order`() async throws {
+        let transport = ServerTestTransport()
+        transport.holdWriteCompletions = true
+        let connection = ServerConnection(transport: transport)
+        let sizes = Locked([Int]())
+        connection.onEvent = { event in
+            switch event {
+            case .binary(let data): sizes.withLock { $0.append(data.count) }
+            case .error(let error): Issue.record(error)
+            default: break
+            }
+        }
+        transport.receive(Data(validUpgradeRequest.utf8))
+        try await eventuallyForServer { transport.writes.count == 1 }
+        // The masked data frame has a 14-byte header; three empty frames add 18 bytes.
+        transport.receive(clientFrame(opcode: .binaryFrame, payload: Data(repeating: 0x61, count: 16 * 1024 * 1024)))
+        for _ in 0..<3 { transport.receive(clientFrame(opcode: .binaryFrame, payload: Data())) }
+
+        transport.completeNextWrite()
+
+        try await eventuallyForServer(attempts: 2_000) { sizes.withLock { $0.count == 4 } }
+        #expect(sizes.withLock { $0 } == [16 * 1024 * 1024, 0, 0, 0])
+        #expect(transport.disconnectCount == 0)
+    }
+
+    @Test(arguments: [false, true])
+    func `Pending upgrades reject input beyond the bounded frame buffer`(inSameRead: Bool) async throws {
+        let transport = ServerTestTransport()
+        transport.holdWriteCompletions = true
+        let connection = ServerConnection(transport: transport)
+        let errors = Locked([UInt16]())
+        let disconnected = Locked(false)
+        connection.onEvent = { event in
+            switch event {
+            case .error(let error): errors.withLock { $0.append((error as? WSError)?.code ?? 0) }
+            case .disconnected: disconnected.withLock { $0 = true }
+            case .connected: Issue.record("An oversized pending upgrade must not open")
+            default: break
+            }
+        }
+        let excess = Data(repeating: 0x00, count: 16 * 1024 * 1024 + 33)
+
+        if inSameRead {
+            transport.receive(Data(validUpgradeRequest.utf8) + excess)
+        } else {
+            transport.receive(Data(validUpgradeRequest.utf8))
+            try await eventuallyForServer { transport.writes.count == 1 }
+            transport.receive(excess.prefix(8 * 1024 * 1024))
+            transport.receive(excess.dropFirst(8 * 1024 * 1024))
+        }
+
+        try await eventuallyForServer { disconnected.withLock { $0 } }
+        #expect(errors.withLock { $0 } == [CloseCode.messageTooBig.rawValue])
+        #expect(transport.disconnectCount == 1)
+        transport.completeNextWrite()
+    }
+
     @Test
     func `A peer close waits for the pending local close to reach the transport`() async throws {
         let transport = ServerTestTransport()
@@ -513,6 +573,52 @@ struct ServerConnectionTests {
 
 @Suite("WebSocket server thread safety")
 struct WebSocketServerThreadSafetyTests {
+    @Test
+    func `Accepted connections deliver buffered EOF after server registration`() async throws {
+        let listenerReady = DispatchSemaphore(value: 0)
+        let accepted = DispatchSemaphore(value: 0)
+        let clientReady = DispatchSemaphore(value: 0)
+        let sent = DispatchSemaphore(value: 0)
+        let disconnected = DispatchSemaphore(value: 0)
+        let incoming = Locked<NWConnection?>(nil)
+        let listener = try NWListener(using: .tcp, on: .any)
+        listener.stateUpdateHandler = { if case .ready = $0 { listenerReady.signal() } }
+        listener.newConnectionHandler = { connection in
+            incoming.withLock { $0 = connection }
+            accepted.signal()
+        }
+        listener.start(queue: DispatchQueue(label: "test.server.listener"))
+        defer { listener.cancel() }
+        try waitForServerEvent(listenerReady)
+        let client = NWConnection(host: "127.0.0.1", port: try #require(listener.port), using: .tcp)
+        client.stateUpdateHandler = { if case .ready = $0 { clientReady.signal() } }
+        client.start(queue: DispatchQueue(label: "test.server.client"))
+        defer { client.cancel() }
+        try waitForServerEvent(clientReady)
+        try waitForServerEvent(accepted)
+        let networkConnection = try #require(incoming.withLock { $0 })
+        defer { networkConnection.cancel() }
+        client.send(content: Data(validUpgradeRequest.utf8), contentContext: .finalMessage, isComplete: true,
+                    completion: .contentProcessed { _ in sent.signal() })
+        try waitForServerEvent(sent)
+        let server = WebSocketServer()
+        let codes = Locked([UInt16]())
+        let releasedConnection = Locked(WeakReference<ServerConnection>())
+        server.onEvent = { event in
+            if case .disconnected(let connection, _, let code) = event {
+                releasedConnection.withLock { $0 = WeakReference(connection as? ServerConnection) }
+                codes.withLock { $0.append(code) }
+                disconnected.signal()
+            }
+        }
+
+        server.accept(connection: networkConnection)
+
+        try waitForServerEvent(disconnected)
+        #expect(codes.withLock { $0 } == [1_006])
+        try await eventuallyForServer { releasedConnection.withLock { $0.value == nil } }
+    }
+
     @Test
     func `Server receives events and removes closed connection`() async throws {
         let server = WebSocketServer()

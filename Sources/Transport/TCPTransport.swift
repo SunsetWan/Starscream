@@ -80,13 +80,19 @@ public class TCPTransport: Transport, @unchecked Sendable {
     public init(connection: NWConnection) {
         proxy = nil
         clientIdentity = nil
-        let generation = state.withLock { state -> UInt64 in
-            state.generation &+= 1
-            state.connection = connection
-            state.isRunning = true
-            return state.generation
+        accept(connection: connection)
+    }
+
+    func accept(connection: NWConnection) {
+        withLifecycleLock {
+            let attempt = beginConnectionAttempt(isTLS: false)
+            attempt.previousConnection?.cancel()
+            guard install(connection: connection, generation: attempt.generation) else {
+                connection.cancel()
+                return
+            }
+            start(connection: connection, generation: attempt.generation)
         }
-        start(connection: connection, generation: generation)
     }
 
     public init() {
