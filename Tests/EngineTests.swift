@@ -14,6 +14,166 @@ import Testing
 
 @Suite("WSEngine state machine")
 struct WSEngineTests {
+    @Test
+    func `A ping callback cannot send a pong on its replacement connection`() async throws {
+        let transport = EngineTestTransport(automaticUpgrade: true)
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder { event in
+            guard case .ping = event else { return }
+            engine.forceStop()
+            engine.start(request: testRequest)
+        }
+        engine.register(delegate: recorder)
+        engine.start(request: testRequest)
+        defer { engine.forceStop() }
+        try await eventually { recorder.events.contains(.connected) }
+
+        transport.emit(.receive(Data([0x89, 0x01, 0x70])))
+        try await eventually { recorder.events.filter(\.isConnected).count == 2 }
+        let completed = Locked(false)
+        engine.write(string: "current") { completed.withLock { $0 = true } }
+        try await eventually { completed.withLock { $0 } }
+
+        #expect(!transport.writes.contains { $0.first == 0x8A })
+        #expect(transport.writes.last?.first == 0x81)
+    }
+
+    @Test
+    func `Handshake leftovers cannot cross a reconnect from the connected callback`() async throws {
+        let retiredMessage = Data([0x81, 0x07]) + Data("retired".utf8)
+        let transport = EngineTestTransport(automaticUpgrade: true, firstUpgradeLeftover: retiredMessage)
+        let engine = WSEngine(transport: transport)
+        let connections = Locked(0)
+        let recorder = EngineEventRecorder { event in
+            guard case .connected = event else { return }
+            let count = connections.withLock { $0 += 1; return $0 }
+            if count == 1 {
+                engine.forceStop()
+                engine.start(request: testRequest)
+            }
+        }
+        engine.register(delegate: recorder)
+        engine.start(request: testRequest)
+        defer { engine.forceStop() }
+        try await eventually { connections.withLock { $0 == 2 } }
+
+        transport.emit(.receive(Data([0x81, 0x07]) + Data("current".utf8)))
+        try await eventually { recorder.events.contains(.text("current")) }
+
+        let events = recorder.events
+        let replacement = try #require(events.lastIndex(of: .connected))
+        #expect(Array(events.dropFirst(replacement + 1)) == [.text("current")])
+    }
+
+    @Test
+    func `Transport callbacks after stop cannot deliver more events`() async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder()
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        let callback = try #require(transport.currentDelegate)
+        engine.forceStop()
+        try await eventually { recorder.events.contains(.cancelled) }
+
+        callback.connectionChanged(state: .viability(false))
+        callback.connectionChanged(state: .shouldReconnect(true))
+        let completed = Locked(false)
+        engine.write(data: Data(), opcode: .binaryFrame) {
+            completed.withLock { $0 = true }
+        }
+        try await eventually { completed.withLock { $0 } }
+
+        #expect(recorder.events == [.connected, .cancelled])
+    }
+
+    @Test
+    func `A peer EOF closes the transport once`() async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder()
+        try await openEngine(engine, transport: transport, recorder: recorder)
+
+        transport.emit(.peerClosed)
+
+        try await eventually { recorder.events.contains(.peerClosed) }
+        #expect(transport.disconnectCount == 1)
+        #expect(recorder.events == [.connected, .peerClosed])
+    }
+
+    @Test
+    func `A peer close callback cannot write into its replacement connection`() async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder { event in
+            guard case .disconnected = event else { return }
+            engine.forceStop()
+            engine.start(request: testRequest)
+        }
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+
+        transport.emit(.receive(Data([0x88, 0x02, 0x03, 0xE8])))
+
+        try await eventually { transport.connectCount == 2 }
+        try await completeEngineHandshake(transport: transport)
+        try await eventually { recorder.events.filter(\.isConnected).count == 2 }
+        #expect(transport.writes.count == 2, "Each connection must write only its opening request")
+        #expect(recorder.events == [.connected, .disconnected("", 1_000), .connected])
+    }
+
+    @Test(arguments: [false, true])
+    func `An error callback can reconnect without old cleanup closing the replacement`(wasOpen: Bool) async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder { event in
+            guard case .error = event else { return }
+            engine.forceStop()
+            engine.start(request: testRequest)
+        }
+        defer { engine.forceStop() }
+
+        if wasOpen {
+            try await openEngine(engine, transport: transport, recorder: recorder)
+            transport.emit(.failed(EngineTestError.staleCallback))
+        } else {
+            engine.register(delegate: recorder)
+            engine.start(request: testRequest)
+            try await eventually { transport.connectCount == 1 }
+            transport.emit(.connected)
+            try await eventually { transport.writes.count == 1 }
+            transport.emit(.receive(Data("HTTP/1.1 400 Bad Request\r\n\r\n".utf8)))
+        }
+
+        try await eventually { transport.connectCount == 2 }
+        try await completeEngineHandshake(transport: transport)
+        let expected: [EngineEventSnapshot] = wasOpen
+            ? [.connected, .error, .connected]
+            : [.error, .connected]
+        try await eventually { recorder.events == expected }
+        #expect(transport.disconnectCount == 1)
+    }
+
+    @Test
+    func `A rejected write cannot close a connection started by its completion`() async throws {
+        let transport = EngineTestTransport()
+        let recorder = EngineEventRecorder()
+        let engine = WSEngine(transport: transport)
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+
+        engine.write(data: Data([0xFF]), opcode: .textFrame) {
+            engine.forceStop()
+            engine.start(request: testRequest)
+        }
+
+        try await eventually { transport.connectCount == 2 }
+        try await completeEngineHandshake(transport: transport)
+        try await eventually { recorder.events.filter(\.isConnected).count == 2 }
+
+        #expect(recorder.events == [.connected, .cancelled, .connected])
+        #expect(transport.disconnectCount == 1)
+    }
+
     struct InvalidAcceptCase: Sendable, CustomTestStringConvertible {
         enum Value: Sendable {
             case missing
@@ -569,6 +729,13 @@ private final class EngineTestTransport: Transport, @unchecked Sendable {
     }
 
     private let state = Locked(State())
+    private let automaticUpgrade: Bool
+    private let firstUpgradeLeftover: Data
+
+    init(automaticUpgrade: Bool = false, firstUpgradeLeftover: Data = Data()) {
+        self.automaticUpgrade = automaticUpgrade
+        self.firstUpgradeLeftover = firstUpgradeLeftover
+    }
 
     var usingTLS: Bool { false }
     var writes: [Data] { state.withLock { $0.writes } }
@@ -586,6 +753,9 @@ private final class EngineTestTransport: Transport, @unchecked Sendable {
 
     func connect(url: URL, timeout: Double, certificatePinning: CertificatePinning?) {
         state.withLock { $0.connectCount += 1 }
+        if automaticUpgrade {
+            emit(.connected)
+        }
     }
 
     func disconnect() {
@@ -603,6 +773,16 @@ private final class EngineTestTransport: Transport, @unchecked Sendable {
         }
         if shouldComplete {
             completion(nil)
+        }
+        if automaticUpgrade,
+           let request = String(data: data, encoding: .utf8),
+           request.hasPrefix("GET "),
+           let key = httpHeader(named: "Sec-WebSocket-Key", in: request) {
+            var response = Data(validHTTPResponse(key: key).utf8)
+            if connectCount == 1 {
+                response.append(firstUpgradeLeftover)
+            }
+            emit(.receive(response))
         }
     }
 
@@ -811,6 +991,11 @@ private final class AcceptingHeaderValidator: HeaderValidator, Sendable {
 private final class EngineEventRecorder: EngineDelegate, @unchecked Sendable {
     private let storage = Locked([EngineEventSnapshot]())
     private let errorStorage = Locked([UInt16]())
+    private let onEvent: (@Sendable (WebSocketEvent) -> Void)?
+
+    init(onEvent: (@Sendable (WebSocketEvent) -> Void)? = nil) {
+        self.onEvent = onEvent
+    }
 
     var events: [EngineEventSnapshot] { storage.withLock { $0 } }
     var errorCodes: [UInt16] { errorStorage.withLock { $0 } }
@@ -820,6 +1005,7 @@ private final class EngineEventRecorder: EngineDelegate, @unchecked Sendable {
             errorStorage.withLock { $0.append(error.code) }
         }
         storage.withLock { $0.append(EngineEventSnapshot(event)) }
+        onEvent?(event)
     }
 
     func clear() {
@@ -935,15 +1121,24 @@ private func openEngine(
     engine.register(delegate: recorder)
     engine.start(request: testRequest)
     try await eventually { transport.connectCount == 1 }
+    try await completeEngineHandshake(transport: transport, extensionSelection: extensionSelection)
+    try await eventually { recorder.events == [.connected] }
+}
+
+private func completeEngineHandshake(
+    transport: EngineTestTransport,
+    extensionSelection: String? = nil
+) async throws {
+    let writeCount = transport.writes.count
     transport.emit(.connected)
-    try await eventually { transport.writes.count == 1 }
-    let request = try #require(String(data: transport.writes[0], encoding: .utf8))
+    try await eventually { transport.writes.count == writeCount + 1 }
+    let requestData = try #require(transport.writes.last)
+    let request = try #require(String(data: requestData, encoding: .utf8))
     let key = try #require(httpHeader(named: "Sec-WebSocket-Key", in: request))
     let headers = validResponseHeaders(key: key, extensionSelection: extensionSelection)
     let response = "HTTP/1.1 101 Switching Protocols\r\n"
         + headers.map { "\($0.key): \($0.value)\r\n" }.joined() + "\r\n"
     transport.emit(.receive(Data(response.utf8)))
-    try await eventually { recorder.events == [.connected] }
 }
 
 private func validResponseHeaders(

@@ -278,13 +278,14 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 return
             }
             if opcode == .textFrame, String(data: data, encoding: .utf8) == nil {
+                let generation = self.state.attemptGeneration
                 let error = WSError(
                     type: .protocolError,
                     message: "text messages must contain valid UTF-8",
                     code: CloseCode.encoding.rawValue
                 )
                 completion?()
-                self.handleProtocolError(error, generation: self.state.attemptGeneration)
+                self.handleProtocolError(error, generation: generation)
                 return
             }
             self.sendFrame(data: data, opcode: opcode, allowCompression: true, completion: completion)
@@ -306,7 +307,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     }
 
     private func processConnectionState(_ connectionState: ConnectionState, generation: UInt64) {
-        guard isCurrentAttempt(generation) else { return }
+        guard isCurrentAttempt(generation), state.phase != .idle, state.phase != .closed else { return }
         switch connectionState {
         case .connected:
             guard state.phase == .connecting,
@@ -371,9 +372,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
 
         case .peerClosed:
             guard state.phase != .closed else { return }
-            state.phase = .closed
-            resetConnectionModules()
-            releaseAttemptDelegates()
+            finishDisconnect(generation: generation)
             deliverTerminal(.peerClosed)
         }
     }
@@ -451,6 +450,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 }
             }
             broadcast(.connected(headers))
+            guard isCurrentAttempt(generation), state.phase == .open || state.phase == .closing else { return }
             if !leftover.isEmpty {
                 framer.add(data: leftover)
             }
@@ -548,6 +548,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 return
             }
             broadcast(.ping(data))
+            guard isCurrentAttempt(generation),
+                  state.phase == .open || (state.phase == .closing && !state.receivedClose) else { return }
             if state.respondToPingWithPong {
                 sendFrame(
                     data: data ?? Data(),
@@ -573,6 +575,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
             state.phase = .closing
             state.closeCode = code
             deliverTerminal(.disconnected(reason, code))
+            guard isCurrentAttempt(generation), state.phase == .closing else { return }
             let payload = closePayload(code: code, reason: code == CloseCode.noStatusReceived.rawValue ? nil : reason)
             sendFrame(data: payload, opcode: .connectionClose, allowCompression: false) { [weak self] in
                 guard let self else { return }
@@ -675,19 +678,19 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     private func failBeforeUpgrade(_ error: any Error, generation: UInt64) {
         guard isCurrentAttempt(generation), state.phase != .closed else { return }
         state.phase = .closed
-        broadcast(.error(error))
         resetConnectionModules()
         releaseAttemptDelegates()
         transport.disconnect()
+        broadcast(.error(error))
     }
 
     private func failConnection(_ error: any Error, generation: UInt64) {
         guard isCurrentAttempt(generation), state.phase != .closed else { return }
-        broadcast(.error(error))
         state.phase = .closed
         resetConnectionModules()
         releaseAttemptDelegates()
         transport.disconnect()
+        broadcast(.error(error))
     }
 
     private func finishDisconnect(generation: UInt64) {
