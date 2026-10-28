@@ -158,6 +158,7 @@ public extension URL {
                 port = 80
             }
         }
+        guard (1...65_535).contains(port) else { return nil }
         return URLParts(port: port, host: host, isTLS: isTLS)
     }
 }
