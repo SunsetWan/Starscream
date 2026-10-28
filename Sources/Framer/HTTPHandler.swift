@@ -141,7 +141,7 @@ public extension URL {
         guard let scheme = self.scheme else {
             return false
         }
-        return HTTPWSHeader.defaultSSLSchemes.contains(scheme)
+        return HTTPWSHeader.defaultSSLSchemes.contains(scheme.lowercased())
     }
     
     /// getParts pulls host and port from the url.

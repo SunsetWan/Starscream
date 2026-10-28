@@ -14,6 +14,13 @@ import Testing
 
 @Suite("Client HTTP handlers")
 struct HTTPHandlerTests {
+    @Test(arguments: ["wss", "WSS", "wSs", "https", "HTTPS", "HtTpS"])
+    func `Secure URL schemes are case insensitive`(scheme: String) throws {
+        let url = try #require(URL(string: "\(scheme)://example.com/socket"))
+
+        #expect(url.isTLSScheme)
+    }
+
     enum HandlerKind: String, CaseIterable, Sendable, CustomTestStringConvertible {
         case foundation
         case string
