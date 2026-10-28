@@ -137,9 +137,10 @@ extension FoundationSecurity: CertificatePinning {
         #else
         if #available(iOS 15.0, macOS 12.0, tvOS 15.0, watchOS 8.0, *) {
             return SecTrustCopyCertificateChain(trust) as? [SecCertificate] ?? []
-        }
-        return (0..<SecTrustGetCertificateCount(trust)).compactMap {
-            SecTrustGetCertificateAtIndex(trust, $0)
+        } else {
+            return (0..<SecTrustGetCertificateCount(trust)).compactMap {
+                SecTrustGetCertificateAtIndex(trust, $0)
+            }
         }
         #endif
     }

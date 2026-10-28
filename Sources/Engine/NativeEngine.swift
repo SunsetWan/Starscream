@@ -339,7 +339,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             }
             let generation = self.state.generation
             let send = self.dependencies.send
-            Task { [weak self, weak task] in
+            Task { [weak self = self, weak task] in
                 guard let task else {
                     completion?()
                     return
@@ -411,7 +411,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             }
             let generation = self.state.generation
             let sendPing = self.dependencies.sendPing
-            Task { [weak self, weak task] in
+            Task { [weak self = self, weak task] in
                 guard let task else {
                     completion?()
                     return
@@ -645,7 +645,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 certificatePinning.evaluateTrust(
                     trust: trust,
                     domain: challenge.protectionSpace.host
-                ) { [weak self] result in
+                ) { [weak self = self] result in
                     guard let self else {
                         complete(.cancelAuthenticationChallenge, nil)
                         return
