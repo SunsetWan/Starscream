@@ -208,6 +208,7 @@ class Decompressor {
     private var buffer = [UInt8](repeating: 0, count: 0x2000)
     private var inflateInitialized = false
     private let windowBits: Int
+    private var lastInputByte: UInt8 = 0
 
     init?(windowBits: Int) {
         self.windowBits = windowBits
@@ -248,6 +249,10 @@ class Decompressor {
         }
 
         if finish {
+            // The wire payload must end at the stored-block length field. Appending the
+            // removed flush bytes must not repair a truncated compressed message.
+            guard inflateSyncPoint(&strm) == 1 else { throw Self.invalidStreamError() }
+            let outputCount = decompressed.count
             let tail:[UInt8] = [0x00, 0x00, 0xFF, 0xFF]
             try decompress(
                 bytes: tail,
@@ -255,6 +260,7 @@ class Decompressor {
                 out: &decompressed,
                 maximumOutputSize: maximumOutputSize
             )
+            guard decompressed.count == outputCount else { throw Self.invalidStreamError() }
         }
 
         return decompressed
@@ -266,12 +272,10 @@ class Decompressor {
         out: inout Data,
         maximumOutputSize: Int
     ) throws {
-        var res: CInt = 0
-        var outputCapacity = buffer.count
         strm.next_in = UnsafeMutablePointer<UInt8>(mutating: bytes)
         strm.avail_in = CUnsignedInt(count)
 
-        repeat {
+        while true {
             guard out.count <= maximumOutputSize else {
                 throw Self.messageTooBigError(maximum: maximumOutputSize)
             }
@@ -279,12 +283,19 @@ class Decompressor {
             // Give zlib one sentinel byte beyond the limit. This distinguishes an
             // exact-boundary message from a stream that would produce more output,
             // without ever appending the excess byte to `Data`.
-            outputCapacity = min(buffer.count, remaining == Int.max ? Int.max : remaining + 1)
-            buffer.withUnsafeMutableBytes { (bufferPtr) in
+            let outputCapacity = min(buffer.count, remaining == Int.max ? Int.max : remaining + 1)
+            let availableInput = strm.avail_in
+            let result = buffer.withUnsafeMutableBytes { bufferPtr -> CInt in
                 strm.next_out = bufferPtr.bindMemory(to: UInt8.self).baseAddress
                 strm.avail_out = CUnsignedInt(outputCapacity)
 
-                res = inflate(&strm, 0)
+                return inflate(&strm, Z_BLOCK)
+            }
+            guard result == Z_OK || result == Z_BUF_ERROR || result == Z_STREAM_END else {
+                throw Self.invalidStreamError()
+            }
+            if strm.avail_in < availableInput {
+                lastInputByte = bytes[count - Int(strm.avail_in) - 1]
             }
 
             let byteCount = outputCapacity - Int(strm.avail_out)
@@ -292,13 +303,33 @@ class Decompressor {
                 throw Self.messageTooBigError(maximum: maximumOutputSize)
             }
             out.append(buffer, count: byteCount)
-        } while res == Z_OK && strm.avail_out == 0
 
-        guard (res == Z_OK && strm.avail_out > 0)
-            || (res == Z_BUF_ERROR && Int(strm.avail_out) == outputCapacity)
-            else {
-                throw WSError(type: .compressionError, message: "Error on decompressing", code: 0)
+            let atBlockBoundary = strm.data_type & 128 != 0
+            if atBlockBoundary && strm.data_type & 64 != 0 {
+                // RFC 7692 allows more blocks after BFINAL, but its alignment bits must be zero.
+                let unusedBits = Int(strm.data_type & 63)
+                guard unusedBits < 8,
+                      unusedBits == 0 || lastInputByte >> (8 - unusedBits) == 0 else {
+                    throw Self.invalidStreamError()
+                }
+                // BFINAL ends a DEFLATE stream, not the WebSocket message or its LZ77 context.
+                guard inflateResetKeep(&strm) == Z_OK else { throw Self.invalidStreamError() }
+            } else if result == Z_STREAM_END {
+                guard inflateResetKeep(&strm) == Z_OK else { throw Self.invalidStreamError() }
+            }
+
+            if strm.avail_in == 0, inflateSyncPoint(&strm) == 1 {
+                return
+            }
+            if strm.avail_in == availableInput, byteCount == 0, !atBlockBoundary {
+                guard strm.avail_in == 0 else { throw Self.invalidStreamError() }
+                return
+            }
         }
+    }
+
+    private static func invalidStreamError() -> WSError {
+        WSError(type: .compressionError, message: "invalid permessage-deflate payload", code: CloseCode.protocolError.rawValue)
     }
 
     private static func messageTooBigError(maximum: Int) -> WSError {
@@ -349,8 +380,8 @@ class Compressor {
 
     func compress(_ data: Data) throws -> Data {
         guard !data.isEmpty else {
-            // For example, PONG has no content
-            return data
+            // RFC 7692 retains the empty stored-block header after removing the flush tail.
+            return Data([0x00])
         }
 
         var compressed = Data()
