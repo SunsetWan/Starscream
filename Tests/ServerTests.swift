@@ -14,6 +14,69 @@ import Testing
 
 @Suite("Server connection")
 struct ServerConnectionTests {
+    @Test(arguments: [false, true])
+    func `EOF preserves the last server message and waits for its close response`(holdCloseWrite: Bool) async throws {
+        let transport = ServerTestTransport()
+        let connection = ServerConnection(transport: transport)
+        try await open(connection, transport: transport)
+        let events = Locked([String]())
+        connection.onEvent = { event in
+            switch event {
+            case .text(let text): events.withLock { $0.append("text:\(text)") }
+            case .disconnected(let reason, let code): events.withLock { $0.append("disconnected:\(reason):\(code)") }
+            case .error: events.withLock { $0.append("error") }
+            default: break
+            }
+        }
+        transport.holdWriteCompletions = holdCloseWrite
+        let closePayload = Data([0x03, 0xE8]) + Data("bye".utf8)
+        transport.receive(
+            clientFrame(opcode: .textFrame, payload: Data("last".utf8))
+                + clientFrame(opcode: .connectionClose, payload: closePayload)
+        )
+        connection.connectionChanged(state: .peerClosed)
+        try await eventuallyForServer { transport.writes.count == 2 || transport.disconnectCount == 1 }
+
+        if holdCloseWrite {
+            #expect(events.withLock { $0 } == ["text:last"])
+            #expect(transport.disconnectCount == 0)
+            transport.completeNextWrite()
+        }
+        try await eventuallyForServer { events.withLock { $0.contains { $0.hasPrefix("disconnected:") } } }
+
+        #expect(events.withLock { $0 } == ["text:last", "disconnected:bye:1000"])
+        #expect(transport.writes.last == Data([0x88, 0x05]) + closePayload)
+        #expect(transport.disconnectCount == 1)
+    }
+
+    @Test
+    func `A retired server close ignores its late write failure`() async throws {
+        let transport = ServerTestTransport()
+        let timeout = Locked<(@Sendable () -> Void)?>(nil)
+        let connection = ServerConnection(transport: transport, timeoutScheduler: { _, queue, action in
+            timeout.withLock { $0 = { queue.sync(execute: action) } }
+        })
+        try await open(connection, transport: transport)
+        let events = Locked([String]())
+        connection.onEvent = { event in
+            switch event {
+            case .error: events.withLock { $0.append("error") }
+            case .disconnected: events.withLock { $0.append("disconnected") }
+            default: break
+            }
+        }
+        transport.holdWriteCompletions = true
+        transport.receive(clientFrame(opcode: .connectionClose, payload: Data([0x03, 0xE8])))
+        try await eventuallyForServer { transport.writes.count == 2 && timeout.withLock { $0 != nil } }
+        let fireTimeout = try #require(timeout.withLock { $0 })
+        fireTimeout()
+
+        transport.completeNextWrite(error: ServerTestWaitError.timedOut)
+        fireTimeout()
+
+        #expect(events.withLock { $0 } == ["disconnected"])
+    }
+
     @Test
     func `A pending upgrade accepts its exact buffer limit and preserves frame order`() async throws {
         let transport = ServerTestTransport()

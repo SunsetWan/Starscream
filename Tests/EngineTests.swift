@@ -15,6 +15,76 @@ import Testing
 @Suite("WSEngine state machine")
 struct WSEngineTests {
     @Test
+    func `A close response write failure cannot emit an error after disconnection`() async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder()
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+        transport.holdWrites = true
+        transport.emit(.receive(Data([0x88, 0x02, 0x03, 0xE8])))
+        try await eventually { transport.writes.count == 2 }
+
+        transport.completeWrite(at: 0, error: EngineTestError.staleCallback)
+        let drained = Locked(false)
+        engine.write(data: Data(), opcode: .binaryFrame) { drained.withLock { $0 = true } }
+        try await eventually { drained.withLock { $0 } }
+
+        #expect(recorder.events == [.connected, .disconnected("", 1_000)])
+        #expect(transport.disconnectCount == 1)
+    }
+
+    @Test(arguments: [false, true])
+    func `EOF preserves the last message and waits for its close response`(holdCloseWrite: Bool) async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport)
+        let recorder = EngineEventRecorder()
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+        transport.holdWrites = holdCloseWrite
+
+        transport.emit(.receive(Data([0x81, 0x04]) + Data("last".utf8) + Data([0x88, 0x02, 0x03, 0xE8])))
+        transport.emit(.peerClosed)
+        try await eventually {
+            recorder.events.contains(.peerClosed) || recorder.events.contains(.disconnected("", 1_000))
+        }
+        let drained = Locked(false)
+        engine.write(data: Data(), opcode: .binaryFrame) { drained.withLock { $0 = true } }
+        try await eventually { drained.withLock { $0 } }
+
+        #expect(recorder.events == [.connected, .text("last"), .disconnected("", 1_000)])
+        #expect(transport.writes.last?.first == 0x88)
+        if holdCloseWrite {
+            #expect(transport.disconnectCount == 0)
+            transport.completeWrite(at: 0, error: nil)
+        }
+        try await eventually { transport.disconnectCount == 1 }
+    }
+
+    @Test
+    func `A peer close waits for the pending client close write`() async throws {
+        let transport = EngineTestTransport()
+        let engine = WSEngine(transport: transport, closeTimeout: 30)
+        let recorder = EngineEventRecorder()
+        try await openEngine(engine, transport: transport, recorder: recorder)
+        defer { engine.forceStop() }
+        transport.holdWrites = true
+        engine.stop(closeCode: CloseCode.normal.rawValue)
+        try await eventually { transport.writes.count == 2 }
+
+        transport.emit(.receive(Data([0x88, 0x02, 0x03, 0xE8])))
+        try await eventually { recorder.events.contains(.disconnected("", 1_000)) }
+        let drained = Locked(false)
+        engine.write(data: Data(), opcode: .binaryFrame) { drained.withLock { $0 = true } }
+        try await eventually { drained.withLock { $0 } }
+
+        #expect(transport.disconnectCount == 0)
+        transport.completeWrite(at: 0, error: nil)
+        try await eventually { transport.disconnectCount == 1 }
+        #expect(transport.writes.count == 2)
+    }
+
+    @Test
     func `A ping callback cannot send a pong on its replacement connection`() async throws {
         let transport = EngineTestTransport(automaticUpgrade: true)
         let engine = WSEngine(transport: transport)

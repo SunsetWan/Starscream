@@ -137,6 +137,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         var closeContext: CloseContext?
         var peerCloseContext: CloseContext?
         var closeWritePending = false
+        var inputClosed = false
         var closeGeneration: UInt64 = 0
         var delegate = WeakReference<any ConnectionDelegate>()
         var onEvent: (@Sendable (ConnectionEvent) -> Void)?
@@ -244,6 +245,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 case ignored
             }
             let destination = state.withLock { state -> Destination in
+                guard !state.inputClosed else { return .ignored }
                 switch state.phase {
                 case .handshaking:
                     return .http
@@ -272,10 +274,24 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         case .cancelled:
             finishDisconnect(reason: "Connection cancelled", code: 1006)
         case .peerClosed:
-            let context = state.withLock { $0.closeContext }
-                ?? CloseContext(reason: "Connection closed by peer", code: 1006)
-            finishDisconnect(reason: context.reason, code: context.code)
+            framer.flush { [weak self] in
+                self?.inputQueue.async { [weak self] in
+                    self?.finishInput()
+                }
+            }
         }
+    }
+
+    private func finishInput() {
+        let context = state.withLock { state -> CloseContext? in
+            guard state.phase != .closed else { return nil }
+            state.inputClosed = true
+            guard !state.closeWritePending else { return nil }
+            return state.peerCloseContext ?? state.closeContext
+                ?? CloseContext(reason: "Connection closed by peer", code: 1006)
+        }
+        guard let context else { return }
+        finishDisconnect(reason: context.reason, code: context.code)
     }
 
     // MARK: - HTTPServerDelegate
@@ -497,7 +513,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     }
 
     private func emit(error: Error) {
-        let callback = state.withLock { $0.onEvent }
+        let callback = state.withLock { $0.phase == .closed ? nil : $0.onEvent }
         callback?(.error(error))
     }
 
@@ -595,6 +611,8 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                         self.finishDisconnect(reason: "Failed to write WebSocket close", code: 1006)
                     } else if let peerClose {
                         self.finishDisconnect(reason: peerClose.reason, code: peerClose.code)
+                    } else if self.state.withLock({ $0.inputClosed }) {
+                        self.finishInput()
                     }
                 }
             }

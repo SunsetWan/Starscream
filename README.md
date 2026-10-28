@@ -386,6 +386,7 @@ Applications with custom Starscream components also need these source changes:
 - Server and server-connection event closures are `@Sendable` and run on private serial queues. Use a task or dispatch queue to update UI state.
 - Custom `CertificatePinning` implementations must be `Sendable`, invoke an `@Sendable` completion, and handle `PinningState.failed` as an optional `Error`.
 - Custom `CompressionHandler` implementations must be reference types and `Sendable`. `load(headers:)` reports whether negotiation succeeded, `decompress(data:isFinal:)` throws on invalid input, and `reset()` clears connection-scoped state.
+- Asynchronous custom `Framer` implementations must implement `flush(completion:)` and deliver all queued frame events before calling its completion. The default implementation supports synchronous framers.
 - `WebSocket` is now a final, thread-safe facade. Put customization in an `Engine`, `Transport`, compression handler, certificate pinner, delegate, or event closure instead of subclassing it.
 
 The stricter contracts prevent unsynchronized user-defined components from weakening the concurrency guarantees of the built-in engines.

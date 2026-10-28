@@ -124,6 +124,8 @@ public protocol FramerEventClient: AnyObject {
 
 public protocol Framer {
     func add(data: Data)
+    /// Delivers all earlier frame events before completion. Asynchronous framers must implement this method.
+    func flush(completion: @escaping @Sendable () -> Void)
     func register(delegate: FramerEventClient)
     func createWriteFrame(opcode: FrameOpCode, payload: Data, isCompressed: Bool) -> Data
     func createWriteFrameResult(opcode: FrameOpCode, payload: Data, isCompressed: Bool) -> Result<Data, Error>
@@ -133,6 +135,10 @@ public protocol Framer {
 }
 
 public extension Framer {
+    func flush(completion: @escaping @Sendable () -> Void) {
+        completion()
+    }
+
     func createWriteFrameResult(opcode: FrameOpCode, payload: Data, isCompressed: Bool) -> Result<Data, Error> {
         .success(createWriteFrame(opcode: opcode, payload: payload, isCompressed: isCompressed))
     }
@@ -170,6 +176,10 @@ public class WSFramer: Framer {
     
     public func supportsCompression() -> Bool {
         return compressionEnabled
+    }
+
+    public func flush(completion: @escaping @Sendable () -> Void) {
+        queue.async(execute: completion)
     }
     
     enum ProcessEvent {
