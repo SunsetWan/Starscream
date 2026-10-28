@@ -13,6 +13,109 @@ import Testing
 @Suite("Server connection")
 struct ServerConnectionTests {
     @Test
+    func `A peer close waits for the pending local close to reach the transport`() async throws {
+        let transport = ServerTestTransport()
+        let timeouts = TestTimeoutScheduler()
+        let connection = ServerConnection(transport: transport, timeoutScheduler: timeouts.schedule)
+        try await open(connection, transport: transport)
+        transport.holdWriteCompletions = true
+        connection.write(data: Data([0x03, 0xE9]), opcode: .connectionClose) { _ in }
+        try await eventuallyForServer { transport.writes.count == 2 && timeouts.count == 1 }
+        let parser = WSFramer(isServer: true)
+        let recorder = ServerCloseFrameRecorder()
+        parser.register(delegate: recorder)
+        parser.add(data: clientFrame(opcode: .connectionClose, payload: Data([0x03, 0xE8])))
+        try waitForServerEvent(recorder.ready)
+
+        connection.frameProcessed(event: .frame(try #require(recorder.frame.withLock { $0 })))
+        try timeouts.flushQueue()
+
+        #expect(transport.disconnectCount == 0)
+        transport.completeNextWrite()
+        try await eventuallyForServer { transport.disconnectCount == 1 }
+        #expect(transport.writes.count == 2)
+    }
+
+    @Test
+    func `A client extension failure receives a legal server close`() async throws {
+        let transport = ServerTestTransport()
+        let connection = ServerConnection(transport: transport)
+        try await open(connection, transport: transport)
+        let codes = Locked([UInt16]())
+        connection.onEvent = { event in
+            if case .disconnected(_, let code) = event { codes.withLock { $0.append(code) } }
+        }
+
+        transport.receive(clientFrame(opcode: .connectionClose, payload: Data([0x03, 0xF2])))
+        try await eventuallyForServer { !codes.withLock { $0.isEmpty } }
+
+        #expect(codes.withLock { $0 } == [1_010])
+        #expect(transport.writes.last == Data([0x88, 0x00]))
+    }
+
+    @Test
+    func `Concurrent local and peer closes complete without a timeout`() throws {
+        let peerReason = String(repeating: "a", count: 123)
+        let peerPayload = makeClosePayload(code: 1_000, reason: Data(peerReason.utf8))
+        let localPayload = makeClosePayload(code: 1_001, reason: Data(repeating: 0x62, count: 123))
+        let parser = WSFramer(isServer: true)
+        let recorder = ServerCloseFrameRecorder()
+        parser.register(delegate: recorder)
+        parser.add(data: clientFrame(opcode: .connectionClose, payload: peerPayload))
+        try waitForServerEvent(recorder.ready)
+        let peerFrame = try #require(recorder.frame.withLock { $0 })
+        let localQueue = DispatchQueue(label: "test.server.local-close")
+        let peerQueue = DispatchQueue(label: "test.server.peer-close")
+        var timeoutCount = 0
+
+        // Exercise both orders and the gap between observing an open connection and closing it.
+        for _ in 0..<200 {
+            let transport = ServerTestTransport()
+            let timeouts = TestTimeoutScheduler()
+            let scheduled = DispatchSemaphore(value: 0)
+            let connection = ServerConnection(transport: transport, timeoutScheduler: { delay, queue, action in
+                timeouts.schedule(after: delay, on: queue, action: action)
+                scheduled.signal()
+            })
+            let opened = DispatchSemaphore(value: 0)
+            let localCompleted = DispatchSemaphore(value: 0)
+            let peerQueued = DispatchSemaphore(value: 0)
+            let reasons = Locked([String]())
+            connection.onEvent = { event in
+                switch event {
+                case .connected: opened.signal()
+                case .disconnected(let reason, _): reasons.withLock { $0.append(reason) }
+                default: break
+                }
+            }
+            transport.receive(Data(validUpgradeRequest.utf8))
+            try waitForServerEvent(opened)
+            let launch = DispatchSemaphore(value: 0)
+            localQueue.async {
+                launch.wait()
+                connection.write(data: localPayload, opcode: .connectionClose) { _ in localCompleted.signal() }
+            }
+            peerQueue.async {
+                launch.wait()
+                connection.frameProcessed(event: .frame(peerFrame))
+                peerQueued.signal()
+            }
+            launch.signal()
+            launch.signal()
+            try waitForServerEvent(localCompleted)
+            try waitForServerEvent(peerQueued)
+            try waitForServerEvent(transport.closeWritten)
+            try waitForServerEvent(scheduled)
+            try timeouts.fireNext()
+
+            let observed = reasons.withLock { $0 }
+            if observed != [peerReason] { timeoutCount += 1 }
+            #expect(transport.disconnectCount == 1)
+        }
+        #expect(timeoutCount == 0)
+    }
+
+    @Test
     func `Server callbacks can safely cross concurrency domains`() {
         let connection = ServerConnection(transport: ServerTestTransport())
         let server = WebSocketServer()
@@ -505,6 +608,22 @@ Sec-WebSocket-Version: 13\r
 
 private func requireSendableServerCallback<T: Sendable>(_: T) {}
 
+private func waitForServerEvent(_ semaphore: DispatchSemaphore) throws {
+    try #require(semaphore.wait(timeout: .now() + 3) == .success)
+}
+
+private final class ServerCloseFrameRecorder: FramerEventClient, Sendable {
+    let ready = DispatchSemaphore(value: 0)
+    let frame = Locked<Frame?>(nil)
+
+    func frameProcessed(event: FrameEvent) {
+        if case .frame(let frame) = event {
+            self.frame.withLock { $0 = frame }
+        }
+        ready.signal()
+    }
+}
+
 private func clientFrame(opcode: FrameOpCode, payload: Data) -> Data {
     try! WSFramer(isServer: false).createWriteFrameResult(
         opcode: opcode,
@@ -564,6 +683,7 @@ private func eventuallyForServer(
 
 private final class ServerTestTransport: Transport, @unchecked Sendable {
     private let storage = Locked(Storage())
+    let closeWritten = DispatchSemaphore(value: 0)
 
     private struct Storage {
         var delegate = WeakReference<any TransportEventClient>()
@@ -571,6 +691,7 @@ private final class ServerTestTransport: Transport, @unchecked Sendable {
         var disconnectCount = 0
         var callWriteCompletionTwice = false
         var holdWriteCompletions = false
+        var pendingWrites = [@Sendable ((any Error)?) -> Void]()
     }
 
     var usingTLS: Bool { false }
@@ -606,6 +727,7 @@ private final class ServerTestTransport: Transport, @unchecked Sendable {
     func write(data: Data, completion: @escaping @Sendable ((any Error)?) -> Void) {
         let behavior = storage.withLock {
             $0.writes.append(data)
+            if $0.holdWriteCompletions { $0.pendingWrites.append(completion) }
             return (hold: $0.holdWriteCompletions, twice: $0.callWriteCompletionTwice)
         }
         guard !behavior.hold else { return }
@@ -613,6 +735,14 @@ private final class ServerTestTransport: Transport, @unchecked Sendable {
         if behavior.twice {
             completion(nil)
         }
+        if data.first == 0x88 { closeWritten.signal() }
+    }
+
+    func completeNextWrite(error: (any Error)? = nil) {
+        let completion = storage.withLock { state -> (@Sendable ((any Error)?) -> Void)? in
+            state.pendingWrites.isEmpty ? nil : state.pendingWrites.removeFirst()
+        }
+        completion?(error)
     }
 
     func receive(_ data: Data) {
