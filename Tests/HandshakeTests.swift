@@ -283,6 +283,33 @@ struct WebSocketHandshakeTests {
         }
     }
 
+    @Test(arguments: ["server_no_context_takeover", "server_max_window_bits=10", "server_max_window_bits=15"])
+    func `A response must honor the server constraints of an accepted offer`(constraint: String) throws {
+        let constrained = "permessage-deflate; \(constraint)"
+        let headers = validServerResponseHeaders(extensions: "permessage-deflate")
+        let constrainedOffer = WebSocketHandshake.ClientOffer(
+            key: "dGhlIHNhbXBsZSBub25jZQ==", extensions: [constrained]
+        )
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: constrainedOffer)
+        }
+
+        let alternatives = WebSocketHandshake.ClientOffer(
+            key: "dGhlIHNhbXBsZSBub25jZQ==", extensions: [constrained, "permessage-deflate"]
+        )
+        try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: alternatives)
+    }
+
+    @Test(arguments: ["+15", "015"])
+    func `Window sizes require canonical decimal digits`(value: String) {
+        let headers = validServerResponseHeaders(extensions: "permessage-deflate; server_max_window_bits=\(value)")
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: Self.offer)
+        }
+    }
+
     @Test("Client window offer values are hints, not response ceilings")
     func acceptsClientWindowLargerThanHint() throws {
         let offer = WebSocketHandshake.ClientOffer(

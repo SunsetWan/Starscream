@@ -83,7 +83,7 @@ public struct HTTPWSHeader {
 	     }
         
         if supportsCompression, req.value(forHTTPHeaderField: HTTPWSHeader.extensionName) == nil {
-            let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+            let val = "permessage-deflate; client_max_window_bits"
             req.setValue(val, forHTTPHeaderField: HTTPWSHeader.extensionName)
         }
         let host = parts.host.contains(":") ? "[\(parts.host)]" : parts.host

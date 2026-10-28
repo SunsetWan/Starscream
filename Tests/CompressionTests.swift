@@ -160,6 +160,8 @@ struct CompressionTests {
         "permessage-deflate; server_max_window_bits=15; server_max_window_bits=14",
         "permessage-deflate; client_no_context_takeover=true",
         "permessage-deflate; client_max_window_bits=\"15 15\"",
+        "permessage-deflate; client_max_window_bits=+15",
+        "permessage-deflate; server_max_window_bits=015",
     ])
     func `Invalid parameters reject negotiation`(header: String) {
         let compression = WSCompression()

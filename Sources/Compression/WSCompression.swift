@@ -167,10 +167,10 @@ public final class WSCompression: CompressionHandler {
                 ? WebSocketHandshake.normalizedExtensionParameterValue(pair[1])
                 : nil
             if parameter == "server_max_window_bits", pair.count == 2,
-               let normalizedValue, let val = Int(normalizedValue), (8...15).contains(val) {
+               let val = WebSocketHandshake.windowBits(normalizedValue) {
                 decompressorWindowBits = val
             } else if parameter == "client_max_window_bits", pair.count == 2,
-                      let normalizedValue, let val = Int(normalizedValue), (8...15).contains(val) {
+                      let val = WebSocketHandshake.windowBits(normalizedValue) {
                 compressorWindowBits = val
             } else if parameter == "client_no_context_takeover", pair.count == 1 {
                 compressorNoContextTakeover = true
