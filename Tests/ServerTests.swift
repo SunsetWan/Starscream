@@ -117,11 +117,17 @@ struct ServerConnectionTests {
         let transport = ServerTestTransport()
         transport.holdWriteCompletions = true
         let connection = ServerConnection(transport: transport)
-        let sizes = Locked([Int]())
+        let (receivedSizes, continuation) = AsyncStream<Int>.makeStream()
+        defer {
+            continuation.finish()
+            withExtendedLifetime(connection) {}
+        }
         connection.onEvent = { event in
             switch event {
-            case .binary(let data): sizes.withLock { $0.append(data.count) }
-            case .error(let error): Issue.record(error)
+            case .binary(let data): continuation.yield(data.count)
+            case .error(let error):
+                Issue.record(error)
+                continuation.finish()
             default: break
             }
         }
@@ -133,8 +139,24 @@ struct ServerConnectionTests {
 
         transport.completeNextWrite()
 
-        try await eventuallyForServer(attempts: 2_000) { sizes.withLock { $0.count == 4 } }
-        #expect(sizes.withLock { $0 } == [16 * 1024 * 1024, 0, 0, 0])
+        let sizes = try await withThrowingTaskGroup(of: [Int].self) { group in
+            defer { group.cancelAll() }
+            group.addTask {
+                var sizes = [Int]()
+                for await size in receivedSizes {
+                    sizes.append(size)
+                    if sizes.count == 4 { break }
+                }
+                return sizes
+            }
+            group.addTask {
+                try await Task.sleep(nanoseconds: 60_000_000_000)
+                throw ServerTestWaitError.timedOut
+            }
+            let result = try await group.next()
+            return try #require(result)
+        }
+        #expect(sizes == [16 * 1024 * 1024, 0, 0, 0])
         #expect(transport.disconnectCount == 0)
     }
 
