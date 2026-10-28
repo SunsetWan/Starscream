@@ -285,6 +285,22 @@ public enum WebSocketHandshake {
         let selectedNames = selection.parameters.map { $0.name.lowercased() }
         guard Set(selectedNames).count == selectedNames.count else { return false }
 
+        var offeredNames = Set<String>()
+        for parameter in offer.parameters {
+            let name = parameter.name.lowercased()
+            guard offeredNames.insert(name).inserted else { return false }
+            switch name {
+            case "client_no_context_takeover", "server_no_context_takeover":
+                guard parameter.value == nil else { return false }
+            case "server_max_window_bits":
+                guard windowBits(parameter.value) != nil else { return false }
+            case "client_max_window_bits":
+                guard parameter.value == nil || windowBits(parameter.value) != nil else { return false }
+            default:
+                return false
+            }
+        }
+
         for requiredName in ["server_no_context_takeover", "server_max_window_bits"] {
             if offer.parameter(named: requiredName) != nil,
                selection.parameter(named: requiredName) == nil {

@@ -11,6 +11,33 @@ import Testing
 
 @Suite("WebSocket handshake")
 struct WebSocketHandshakeTests {
+    @Test(arguments: [
+        ("unknown_parameter", ""),
+        ("client_no_context_takeover=1", ""),
+        ("server_no_context_takeover=1", "; server_no_context_takeover"),
+        ("client_max_window_bits=17", ""),
+        ("client_max_window_bits=015", ""),
+        ("server_max_window_bits", "; server_max_window_bits=15"),
+        ("server_max_window_bits=+15", "; server_max_window_bits=15"),
+        ("client_no_context_takeover; client_no_context_takeover", ""),
+        ("server_max_window_bits=15; server_max_window_bits=15", "; server_max_window_bits=15"),
+    ])
+    func `Invalid compression offers cannot be accepted but valid alternatives remain available`(_ parameters: (String, String)) throws {
+        let invalidOffer = "permessage-deflate; \(parameters.0)"
+        let selection = "permessage-deflate\(parameters.1)"
+        let request = WebSocketHandshake.ServerRequest(key: Self.offer.key, protocols: [], extensions: [invalidOffer])
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.serverResponseHeaders(for: request, selectedExtensions: [selection])
+        }
+
+        let alternatives = WebSocketHandshake.ServerRequest(
+            key: Self.offer.key, protocols: [], extensions: [invalidOffer, "permessage-deflate"]
+        )
+        let headers = try WebSocketHandshake.serverResponseHeaders(for: alternatives, selectedExtensions: [selection])
+        #expect(headers["Sec-WebSocket-Extensions"] == selection)
+    }
+
     struct InvalidServerResponseCase: Sendable, CustomTestStringConvertible {
         let name: String
         let statusCode: Int
