@@ -83,7 +83,7 @@ public struct HTTPWSHeader {
 	     }
         
         if supportsCompression, req.value(forHTTPHeaderField: HTTPWSHeader.extensionName) == nil {
-            let val = "permessage-deflate; client_max_window_bits; server_max_window_bits=15"
+            let val = "permessage-deflate; client_max_window_bits"
             req.setValue(val, forHTTPHeaderField: HTTPWSHeader.extensionName)
         }
         let host = parts.host.contains(":") ? "[\(parts.host)]" : parts.host
@@ -141,7 +141,7 @@ public extension URL {
         guard let scheme = self.scheme else {
             return false
         }
-        return HTTPWSHeader.defaultSSLSchemes.contains(scheme)
+        return HTTPWSHeader.defaultSSLSchemes.contains(scheme.lowercased())
     }
     
     /// getParts pulls host and port from the url.
@@ -158,6 +158,7 @@ public extension URL {
                 port = 80
             }
         }
+        guard (1...65_535).contains(port) else { return nil }
         return URLParts(port: port, host: host, isTLS: isTLS)
     }
 }

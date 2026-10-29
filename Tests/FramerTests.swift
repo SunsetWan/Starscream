@@ -4,6 +4,18 @@ import Testing
 
 @Suite
 struct FramerTests {
+    @Test(arguments: [FrameOpCode.ping, .pong, .connectionClose])
+    func `Control frames remain available when data limits are zero`(opcode: FrameOpCode) async throws {
+        let limits = WebSocketLimits(maximumFrameSize: 0, maximumMessageSize: 0)
+        let payload = opcode == .connectionClose ? Data([0x03, 0xE8]) : Data(repeating: 0x61, count: 125)
+        let writer = WSFramer(isServer: true, limits: limits)
+
+        let wire = try writer.createWriteFrameResult(opcode: opcode, payload: payload, isCompressed: false).get()
+        let received = try await parse([wire], limits: limits)
+
+        #expect(try #require(received.first?.frame).opcode == opcode)
+    }
+
     @Test
     func `Client rejects every masked server frame including pong`() async throws {
         let events = try await parse([maskedFrame(opcode: .pong, payload: Data())])

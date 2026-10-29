@@ -227,6 +227,11 @@ final class TestTimeoutScheduler: Sendable {
         })
         timeout.queue.sync(execute: timeout.action)
     }
+
+    func flushQueue() throws {
+        let queue = try #require(pending.withLock { $0.first?.queue })
+        queue.sync {}
+    }
 }
 
 private final class TransportEventRecorder: TransportEventClient, @unchecked Sendable {

@@ -109,6 +109,10 @@ public final class WebSocket: WebSocketClient, EngineDelegate, @unchecked Sendab
     private let engine: any Engine
     private let state: Locked<State>
 
+    deinit {
+        engine.forceStop()
+    }
+
     public weak var delegate: (any WebSocketDelegate)? {
         get { state.withLock { $0.delegate.value } }
         set { state.withLock { $0.delegate = WeakReference(newValue) } }

@@ -15,10 +15,84 @@ import Testing
 
 @Suite("NativeEngine lifecycle")
 struct NativeEngineTests {
+    @Test(arguments: [false, true])
+    func `Releasing the native connection owner invalidates its session`(usesFacade: Bool) async throws {
+        let harness = NativeEngineHarness()
+        let connections = Locked([NativeEngine.Connection]())
+        let invalidations = Locked(0)
+        var dependencies = harness.dependencies
+        dependencies.makeConnection = { configuration, delegate, request in
+            let connection = NativeEngine.Dependencies.live.makeConnection(configuration, delegate, request)
+            connections.withLock { $0.append(connection) }
+            return connection
+        }
+        dependencies.invalidate = { session in
+            invalidations.withLock { $0 += 1 }
+            session.invalidateAndCancel()
+        }
+        var engine: NativeEngine? = NativeEngine(dependencies: dependencies)
+        let releasedEngine = WeakReference(engine)
+        var socket: WebSocket?
+        if usesFacade {
+            socket = WebSocket(request: nativeTestRequest(), engine: try #require(engine))
+            socket?.connect()
+        } else {
+            engine?.start(request: nativeTestRequest())
+        }
+        defer {
+            for connection in connections.withLock({ $0 }) {
+                connection.session.invalidateAndCancel()
+            }
+        }
+        try await eventuallyNative { harness.resumedMessageLimits.count == 1 }
+
+        engine = nil
+        socket = nil
+
+        try await eventuallyNative { invalidations.withLock { $0 == 1 } }
+        #expect(releasedEngine.value == nil)
+    }
+
     enum Retirement: Sendable {
         case stop
         case gracefulStop
         case reconnect
+    }
+
+    @Test(arguments: [Retirement.stop, .gracefulStop])
+    func `Authentication cancellation can reconnect without retiring the replacement`(retirement: Retirement) async throws {
+        let harness = NativeEngineHarness()
+        let pinner = PendingCertificatePinning()
+        let recorder = NativeEngineRecorder()
+        let closedPaths = Locked([String]())
+        var dependencies = harness.dependencies
+        dependencies.cancelWithCloseCode = { task, _ in
+            closedPaths.withLock { $0.append(task.originalRequest?.url?.path ?? "") }
+        }
+        let engine = NativeEngine(certificatePinning: pinner, dependencies: dependencies)
+        engine.register(delegate: recorder)
+        engine.start(request: nativeTestRequest(path: "old"))
+        defer { engine.forceStop() }
+        try await eventuallyNative { harness.connections.count == 1 }
+        let original = try #require(harness.connections.first)
+        engine.urlSession(original.session, didReceive: try serverTrustChallenge()) { disposition, _ in
+            guard disposition == .cancelAuthenticationChallenge else { return }
+            engine.start(request: nativeTestRequest(path: "new"))
+        }
+        try await eventuallyNative { pinner.hasPendingEvaluation }
+
+        if retirement == .stop {
+            engine.forceStop()
+        } else {
+            engine.stop(closeCode: CloseCode.goingAway.rawValue)
+        }
+        try await eventuallyNative { harness.connections.count == 2 }
+        let replacement = try #require(harness.connections.last)
+        engine.urlSession(replacement.session, webSocketTask: replacement.task, didOpenWithProtocol: "new")
+        try await eventuallyNative { recorder.events.contains(.connected("new")) }
+
+        #expect(!closedPaths.withLock { $0.contains("/new") })
+        #expect(recorder.events == [.connected("new")])
     }
 
     @Test

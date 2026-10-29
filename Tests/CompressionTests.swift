@@ -25,6 +25,68 @@ import Testing
 
 @Suite
 struct CompressionTests {
+    @Test(arguments: [false, true])
+    func `Context takeover after a final block follows the negotiated policy`(resetContext: Bool) throws {
+        let compression = WSCompression()
+        let extensionValue = "permessage-deflate" + (resetContext ? "; server_no_context_takeover" : "")
+        #expect(compression.load(headers: ["Sec-WebSocket-Extensions": extensionValue]))
+        let first = Data([0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00, 0x00])
+        #expect(try compression.decompress(data: first, isFinal: true) == Data("Hello".utf8))
+        let reference = Data([0xF2, 0x00, 0x11, 0x00, 0x00])
+
+        if resetContext {
+            #expect(throws: WSError.self) {
+                try compression.decompress(data: reference, isFinal: true)
+            }
+        } else {
+            #expect(try compression.decompress(data: reference, isFinal: true) == Data("Hello".utf8))
+        }
+    }
+
+    @Test(arguments: [Data([0x00]), Data([0x01]), Data([0x00, 0x00, 0x00, 0xFF, 0xFF, 0x00])])
+    func `Empty stored blocks are valid compressed messages`(payload: Data) throws {
+        let compression = WSCompression(maximumDecompressedMessageSize: 0)
+        #expect(compression.load(headers: ["Sec-WebSocket-Extensions": "permessage-deflate"]))
+
+        #expect(try compression.decompress(data: payload, isFinal: true).isEmpty)
+    }
+
+    @Test(arguments: [
+        Data(),
+        Data([0xF2, 0x48, 0xCD, 0xC9, 0xC9, 0x07]),
+        Data([0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00]),
+        Data([0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x80, 0x00]),
+    ])
+    func `Incomplete compressed messages and nonzero final padding are rejected`(payload: Data) throws {
+        let compression = WSCompression()
+        #expect(compression.load(headers: ["Sec-WebSocket-Extensions": "permessage-deflate"]))
+
+        let error = #expect(throws: WSError.self) {
+            try compression.decompress(data: payload, isFinal: true)
+        }
+
+        #expect(error?.code == CloseCode.protocolError.rawValue)
+    }
+
+    @Test(arguments: [
+        Data([0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00, 0x00]),
+        Data([0xF3, 0x48, 0xCD, 0xC9, 0xC9, 0x07, 0x00, 0xF3, 0x00, 0x11, 0x00, 0x00]),
+    ])
+    func `Final DEFLATE blocks preserve the dictionary across fragments`(payload: Data) throws {
+        // The first fixture is RFC 7692 section 7.2.3.4. The second repeats "Hello"
+        // with a distance reference into the first final block.
+        let expected = Data((payload.count == 8 ? "Hello" : "HelloHello").utf8)
+        for split in 0...payload.count {
+            let compression = WSCompression()
+            #expect(compression.load(headers: ["Sec-WebSocket-Extensions": "permessage-deflate"]))
+
+            var decoded = try compression.decompress(data: Data(payload.prefix(split)), isFinal: false)
+            decoded.append(try compression.decompress(data: Data(payload.dropFirst(split)), isFinal: true))
+
+            #expect(decoded == expected)
+        }
+    }
+
     @Test
     func `Basic compression round trip`() throws {
         let compressor = try #require(Compressor(windowBits: 15))
@@ -98,6 +160,8 @@ struct CompressionTests {
         "permessage-deflate; server_max_window_bits=15; server_max_window_bits=14",
         "permessage-deflate; client_no_context_takeover=true",
         "permessage-deflate; client_max_window_bits=\"15 15\"",
+        "permessage-deflate; client_max_window_bits=+15",
+        "permessage-deflate; server_max_window_bits=015",
     ])
     func `Invalid parameters reject negotiation`(header: String) {
         let compression = WSCompression()
@@ -195,6 +259,8 @@ struct CompressionTests {
 
         for message in [
             Data(String(repeating: "shared-dictionary-", count: 40).utf8),
+            Data(),
+            Data(),
             Data(String(repeating: "shared-dictionary-", count: 40).utf8),
         ] {
             let compressed = try #require(compression.compress(data: message))
@@ -211,7 +277,7 @@ struct CompressionTests {
 
         let compressed = try #require(compression.compress(data: Data()))
 
-        #expect(compressed.isEmpty)
+        #expect(compressed == Data([0x00]))
         #expect(try compression.decompress(data: compressed, isFinal: true).isEmpty)
     }
 

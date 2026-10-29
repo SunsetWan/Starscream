@@ -39,14 +39,14 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
     private struct State {
         var connections = [String: ServerConnection]()
         var listener: NWListener?
-        var onEvent: ((ServerEvent) -> Void)?
+        var onEvent: (@Sendable (ServerEvent) -> Void)?
     }
 
     private let state = Locked(State())
     private let queue = DispatchQueue(label: "com.vluxe.starscream.server.networkstream")
     private let callbackQueue = DispatchQueue(label: "com.vluxe.starscream.server.callbacks")
 
-    public var onEvent: ((ServerEvent) -> Void)? {
+    public var onEvent: (@Sendable (ServerEvent) -> Void)? {
         get { state.withLock { $0.onEvent } }
         set { state.withLock { $0.onEvent = newValue } }
     }
@@ -73,9 +73,7 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
                 networkConnection.cancel()
                 return
             }
-            let connection = ServerConnection(transport: TCPTransport(connection: networkConnection))
-            connection.delegate = self
-            self.register(connection)
+            self.accept(connection: networkConnection)
         }
         state.withLock { $0.listener = listener }
         listener.start(queue: queue)
@@ -96,6 +94,14 @@ public final class WebSocketServer: Server, ConnectionDelegate, @unchecked Senda
 
     func register(_ connection: ServerConnection) {
         state.withLock { $0.connections[connection.uuid] = connection }
+    }
+
+    func accept(connection networkConnection: NWConnection) {
+        let transport = TCPTransport()
+        let connection = ServerConnection(transport: transport)
+        connection.delegate = self
+        register(connection)
+        transport.accept(connection: networkConnection)
     }
 
     var connectionCount: Int {
@@ -129,9 +135,12 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         var phase: Phase = .handshaking
         var pendingData = Data()
         var closeContext: CloseContext?
+        var peerCloseContext: CloseContext?
+        var closeWritePending = false
+        var inputClosed = false
         var closeGeneration: UInt64 = 0
         var delegate = WeakReference<any ConnectionDelegate>()
-        var onEvent: ((ConnectionEvent) -> Void)?
+        var onEvent: (@Sendable (ConnectionEvent) -> Void)?
     }
 
     let transport: any Transport
@@ -143,9 +152,10 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     private let outputQueue: DispatchQueue
     private let id: String
     private let closeTimeout: TimeInterval
+    private let maximumPendingUpgradeBytes = WebSocketLimits.default.maximumFrameSize + MaxFrameSize
     private let timeoutScheduler: @Sendable (TimeInterval, DispatchQueue, @escaping @Sendable () -> Void) -> Void
 
-    public var onEvent: ((ConnectionEvent) -> Void)? {
+    public var onEvent: (@Sendable (ConnectionEvent) -> Void)? {
         get { state.withLock { $0.onEvent } }
         set { state.withLock { $0.onEvent = newValue } }
     }
@@ -176,10 +186,10 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         inputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.input.\(id)")
         outputQueue = DispatchQueue(label: "com.vluxe.starscream.server.connection.output.\(id)")
 
-        transport.register(delegate: self)
         httpHandler.register(delegate: self)
         framer.register(delegate: self)
         frameHandler.delegate = self
+        transport.register(delegate: self)
     }
 
     public func write(data: Data, opcode: FrameOpCode) {
@@ -231,14 +241,16 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 case http
                 case frame
                 case buffered
+                case overflow
                 case ignored
             }
             let destination = state.withLock { state -> Destination in
+                guard !state.inputClosed else { return .ignored }
                 switch state.phase {
                 case .handshaking:
                     return .http
                 case .upgrading:
-                    state.pendingData.append(data)
+                    guard appendPendingUpgrade(data, to: &state) else { return .overflow }
                     return .buffered
                 case .open, .closing:
                     return .frame
@@ -251,6 +263,8 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 httpHandler.parse(data: data)
             case .frame:
                 framer.add(data: data)
+            case .overflow:
+                failPendingUpgrade()
             case .buffered, .ignored:
                 break
             }
@@ -260,10 +274,31 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         case .cancelled:
             finishDisconnect(reason: "Connection cancelled", code: 1006)
         case .peerClosed:
-            let context = state.withLock { $0.closeContext }
-                ?? CloseContext(reason: "Connection closed by peer", code: 1006)
-            finishDisconnect(reason: context.reason, code: context.code)
+            state.withLock { $0.inputClosed = true }
+            flushInput()
         }
+    }
+
+    private func flushInput() {
+        // A pending upgrade owns bytes that have not reached the framer yet.
+        let canFinish = state.withLock { $0.phase != .upgrading }
+        framer.flush { [weak self] in
+            guard canFinish else { return }
+            self?.inputQueue.async { [weak self] in
+                self?.finishInput()
+            }
+        }
+    }
+
+    private func finishInput() {
+        let context = state.withLock { state -> CloseContext? in
+            guard state.phase != .closed, state.phase != .upgrading else { return nil }
+            guard !state.closeWritePending else { return nil }
+            return state.peerCloseContext ?? state.closeContext
+                ?? CloseContext(reason: "Connection closed by peer", code: 1006)
+        }
+        guard let context else { return }
+        finishDisconnect(reason: context.reason, code: context.code)
     }
 
     // MARK: - HTTPServerDelegate
@@ -271,13 +306,16 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     public func didReceive(event: HTTPEvent) {
         switch event {
         case .success(let headers, let leftover):
-            let shouldUpgrade = state.withLock { state -> Bool in
-                guard state.phase == .handshaking else { return false }
+            let canBuffer = state.withLock { state -> Bool? in
+                guard state.phase == .handshaking else { return nil }
                 state.phase = .upgrading
-                state.pendingData.append(leftover)
-                return true
+                return appendPendingUpgrade(leftover, to: &state)
             }
-            guard shouldUpgrade else { return }
+            guard let canBuffer else { return }
+            guard canBuffer else {
+                failPendingUpgrade()
+                return
+            }
 
             let response = httpHandler.createResponse(headers: [:])
             guard !response.isEmpty else {
@@ -307,6 +345,18 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         }
     }
 
+    private func appendPendingUpgrade(_ data: Data, to state: inout State) -> Bool {
+        guard data.count <= maximumPendingUpgradeBytes - state.pendingData.count else { return false }
+        state.pendingData.append(data)
+        return true
+    }
+
+    private func failPendingUpgrade() {
+        let reason = "input buffered during the WebSocket upgrade exceeds its configured maximum"
+        emit(error: WSError(type: .protocolError, message: reason, code: CloseCode.messageTooBig.rawValue))
+        finishDisconnect(reason: reason, code: CloseCode.messageTooBig.rawValue)
+    }
+
     private func finishUpgrade(headers: [String: String], error: Error?) {
         if let error {
             emit(error: error)
@@ -324,6 +374,9 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         if !pendingData.isEmpty {
             framer.add(data: pendingData)
         }
+        if state.withLock({ $0.inputClosed }) {
+            flushInput()
+        }
     }
 
     // MARK: - FramerEventClient
@@ -340,7 +393,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         switch event {
         case .frame(let frame):
             if frame.opcode == .connectionClose {
-                handlePeerClose(frame, phase: phase)
+                handlePeerClose(frame)
             } else if phase == .open {
                 frameHandler.add(frame: frame)
             } else if frame.opcode == .ping {
@@ -389,7 +442,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         )
     }
 
-    private func handlePeerClose(_ frame: Frame, phase: Phase) {
+    private func handlePeerClose(_ frame: Frame) {
         let reason: String
         if frame.payload.isEmpty {
             reason = "Connection closed by peer"
@@ -403,15 +456,22 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
             ))
             return
         }
-        if phase == .closing {
-            finishDisconnect(reason: reason, code: frame.closeCode)
-            return
+        let shouldHandle = state.withLock { state -> Bool in
+            guard state.phase == .open || state.phase == .closing,
+                  state.peerCloseContext == nil else { return false }
+            state.peerCloseContext = CloseContext(reason: reason, code: frame.closeCode)
+            return true
         }
-
+        guard shouldHandle else { return }
+        // 1010 is only legal in a client Close; acknowledge it without a server status code.
         let payload = frame.closeCode == CloseCode.noStatusReceived.rawValue
+            || frame.closeCode == CloseCode.mandatoryExtension.rawValue
             ? Data()
             : closePayload(code: frame.closeCode, reason: frame.payload)
-        initiateClose(reason: reason, code: frame.closeCode, payload: payload)
+        if !initiateClose(reason: reason, code: frame.closeCode, payload: payload),
+           !state.withLock({ $0.closeWritePending }) {
+            finishDisconnect(reason: reason, code: frame.closeCode)
+        }
     }
 
     private func failWebSocket(with error: Error) {
@@ -424,15 +484,17 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
         )
     }
 
-    private func initiateClose(reason: String, code: UInt16, payload: Data) {
+    @discardableResult
+    private func initiateClose(reason: String, code: UInt16, payload: Data) -> Bool {
         let generation = state.withLock { state -> UInt64? in
             guard state.phase == .open else { return nil }
             state.phase = .closing
             state.closeContext = CloseContext(reason: reason, code: code)
+            state.closeWritePending = true
             state.closeGeneration &+= 1
             return state.closeGeneration
         }
-        guard let generation else { return }
+        guard let generation else { return false }
 
         writeFrame(data: payload, opcode: .connectionClose) { [weak self] error in
             self?.inputQueue.async { [weak self] in
@@ -442,12 +504,14 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
             }
         }
         scheduleCloseTimeout(generation: generation)
+        return true
     }
 
     private func finishDisconnect(reason: String, code: UInt16) {
-        let callbacks = state.withLock { state -> (ConnectionDelegate?, ((ConnectionEvent) -> Void)?)? in
+        let callbacks = state.withLock { state -> (ConnectionDelegate?, (@Sendable (ConnectionEvent) -> Void)?)? in
             guard state.phase != .closed else { return nil }
             state.phase = .closed
+            state.closeWritePending = false
             state.closeGeneration &+= 1
             state.pendingData.removeAll(keepingCapacity: false)
             return (state.delegate.value, state.onEvent)
@@ -459,7 +523,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
     }
 
     private func emit(error: Error) {
-        let callback = state.withLock { $0.onEvent }
+        let callback = state.withLock { $0.phase == .closed ? nil : $0.onEvent }
         callback?(.error(error))
     }
 
@@ -534,6 +598,7 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 guard state.phase == .open else { return nil }
                 state.phase = .closing
                 state.closeContext = closeContext
+                state.closeWritePending = true
                 state.closeGeneration &+= 1
                 return state.closeGeneration
             }
@@ -541,17 +606,27 @@ public final class ServerConnection: Connection, HTTPServerDelegate, FramerEvent
                 completion.call(ServerConnectionError.notOpen)
                 return
             }
-            transport.write(data: frame) { [weak self] error in
+            let writeCompletion = CompletionOnce { [weak self] error in
                 completion.call(error)
                 guard let self else { return }
                 self.inputQueue.async { [weak self] in
-                    guard let self else { return }
+                    guard let self,
+                          self.state.withLock({ $0.phase == .closing && $0.closeGeneration == generation }) else { return }
+                    let peerClose = self.state.withLock { state in
+                        state.closeWritePending = false
+                        return state.peerCloseContext
+                    }
                     if let error {
                         self.emit(error: error)
                         self.finishDisconnect(reason: "Failed to write WebSocket close", code: 1006)
+                    } else if let peerClose {
+                        self.finishDisconnect(reason: peerClose.reason, code: peerClose.code)
+                    } else if self.state.withLock({ $0.inputClosed }) {
+                        self.flushInput()
                     }
                 }
             }
+            transport.write(data: frame, completion: writeCompletion.call)
             inputQueue.async { [weak self] in
                 self?.scheduleCloseTimeout(generation: generation)
             }

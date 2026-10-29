@@ -11,6 +11,33 @@ import Testing
 
 @Suite("WebSocket handshake")
 struct WebSocketHandshakeTests {
+    @Test(arguments: [
+        ("unknown_parameter", ""),
+        ("client_no_context_takeover=1", ""),
+        ("server_no_context_takeover=1", "; server_no_context_takeover"),
+        ("client_max_window_bits=17", ""),
+        ("client_max_window_bits=015", ""),
+        ("server_max_window_bits", "; server_max_window_bits=15"),
+        ("server_max_window_bits=+15", "; server_max_window_bits=15"),
+        ("client_no_context_takeover; client_no_context_takeover", ""),
+        ("server_max_window_bits=15; server_max_window_bits=15", "; server_max_window_bits=15"),
+    ])
+    func `Invalid compression offers cannot be accepted but valid alternatives remain available`(_ parameters: (String, String)) throws {
+        let invalidOffer = "permessage-deflate; \(parameters.0)"
+        let selection = "permessage-deflate\(parameters.1)"
+        let request = WebSocketHandshake.ServerRequest(key: Self.offer.key, protocols: [], extensions: [invalidOffer])
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.serverResponseHeaders(for: request, selectedExtensions: [selection])
+        }
+
+        let alternatives = WebSocketHandshake.ServerRequest(
+            key: Self.offer.key, protocols: [], extensions: [invalidOffer, "permessage-deflate"]
+        )
+        let headers = try WebSocketHandshake.serverResponseHeaders(for: alternatives, selectedExtensions: [selection])
+        #expect(headers["Sec-WebSocket-Extensions"] == selection)
+    }
+
     struct InvalidServerResponseCase: Sendable, CustomTestStringConvertible {
         let name: String
         let statusCode: Int
@@ -280,6 +307,33 @@ struct WebSocketHandshakeTests {
                 headers: headers,
                 offer: offer
             )
+        }
+    }
+
+    @Test(arguments: ["server_no_context_takeover", "server_max_window_bits=10", "server_max_window_bits=15"])
+    func `A response must honor the server constraints of an accepted offer`(constraint: String) throws {
+        let constrained = "permessage-deflate; \(constraint)"
+        let headers = validServerResponseHeaders(extensions: "permessage-deflate")
+        let constrainedOffer = WebSocketHandshake.ClientOffer(
+            key: "dGhlIHNhbXBsZSBub25jZQ==", extensions: [constrained]
+        )
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: constrainedOffer)
+        }
+
+        let alternatives = WebSocketHandshake.ClientOffer(
+            key: "dGhlIHNhbXBsZSBub25jZQ==", extensions: [constrained, "permessage-deflate"]
+        )
+        try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: alternatives)
+    }
+
+    @Test(arguments: ["+15", "015"])
+    func `Window sizes require canonical decimal digits`(value: String) {
+        let headers = validServerResponseHeaders(extensions: "permessage-deflate; server_max_window_bits=\(value)")
+
+        #expect(throws: WebSocketHandshake.ValidationError.self) {
+            try WebSocketHandshake.validateServerResponse(statusCode: 101, headers: headers, offer: Self.offer)
         }
     }
 

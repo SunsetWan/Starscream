@@ -60,7 +60,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             makeConnection: { configuration, delegate, request in
                 let session = URLSession(
                     configuration: configuration,
-                    delegate: delegate,
+                    delegate: SessionDelegate(engine: delegate),
                     delegateQueue: nil
                 )
                 return Connection(session: session, task: session.webSocketTask(with: request))
@@ -146,6 +146,53 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     private let clientIdentity: WebSocketClientIdentity?
     private let limits: WebSocketLimits
     private let dependencies: Dependencies
+
+    deinit {
+        tearDown(detachResources())
+    }
+
+    // URLSession retains its delegate until invalidation. A weak bridge lets the engine's
+    // owner release the connection without waiting for a network callback.
+    private final class SessionDelegate: NSObject, URLSessionWebSocketDelegate, @unchecked Sendable {
+        weak var engine: NativeEngine?
+
+        init(engine: NativeEngine) {
+            self.engine = engine
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            webSocketTask: URLSessionWebSocketTask,
+            didOpenWithProtocol protocol: String?
+        ) {
+            engine?.urlSession(session, webSocketTask: webSocketTask, didOpenWithProtocol: `protocol`)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            webSocketTask: URLSessionWebSocketTask,
+            didCloseWith closeCode: URLSessionWebSocketTask.CloseCode,
+            reason: Data?
+        ) {
+            engine?.urlSession(session, webSocketTask: webSocketTask, didCloseWith: closeCode, reason: reason)
+        }
+
+        func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
+            engine?.urlSession(session, task: task, didCompleteWithError: error)
+        }
+
+        func urlSession(
+            _ session: URLSession,
+            didReceive challenge: URLAuthenticationChallenge,
+            completionHandler: @escaping @Sendable (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+        ) {
+            guard let engine else {
+                completionHandler(.cancelAuthenticationChallenge, nil)
+                return
+            }
+            engine.urlSession(session, didReceive: challenge, completionHandler: completionHandler)
+        }
+    }
 
     public override init() {
         certificatePinning = nil
@@ -293,6 +340,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
     public func stop(closeCode: UInt16) {
         performOnEventQueue {
             guard self.state.phase == .connecting || self.state.phase == .open else { return }
+            let generation = self.state.generation
             let nativeCode = URLSessionWebSocketTask.CloseCode(rawValue: Int(closeCode))
                 ?? .normalClosure
             self.state.phase = .closing
@@ -302,6 +350,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             for complete in pendingAuthentication {
                 complete(.cancelAuthenticationChallenge, nil)
             }
+            guard generation == self.state.generation, self.state.phase == .closing else { return }
             self.state.receiveTask?.cancel()
             self.state.receiveTask = nil
             guard let task = self.state.task else {
@@ -339,7 +388,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             }
             let generation = self.state.generation
             let send = self.dependencies.send
-            Task { [weak self, weak task] in
+            Task { [weak self = self, weak task] in
                 guard let task else {
                     completion?()
                     return
@@ -411,7 +460,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
             }
             let generation = self.state.generation
             let sendPing = self.dependencies.sendPing
-            Task { [weak self, weak task] in
+            Task { [weak self = self, weak task] in
                 guard let task else {
                     completion?()
                     return
@@ -495,6 +544,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
         state.phase = .terminal
         let resources = detachResources()
         tearDown(resources)
+        guard generation == state.generation else { return }
         broadcast(event)
     }
 
@@ -645,7 +695,7 @@ public class NativeEngine: NSObject, Engine, URLSessionDataDelegate, URLSessionW
                 certificatePinning.evaluateTrust(
                     trust: trust,
                     domain: challenge.protectionSpace.host
-                ) { [weak self] result in
+                ) { [weak self = self] result in
                     guard let self else {
                         complete(.cancelAuthenticationChallenge, nil)
                         return

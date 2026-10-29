@@ -14,6 +14,29 @@ import Testing
 
 @Suite("Client HTTP handlers")
 struct HTTPHandlerTests {
+    @Test(arguments: ["[::1]", "[2001:db8::1]:8080"])
+    func `IPv6 upgrade hosts use one pair of brackets`(authority: String) throws {
+        let request = URLRequest(url: try #require(URL(string: "ws://\(authority)/socket")))
+
+        let upgrade = HTTPWSHeader.createUpgrade(request: request, supportsCompression: false, secKeyValue: "key")
+
+        #expect(upgrade.value(forHTTPHeaderField: "Host") == authority)
+    }
+
+    @Test(arguments: [0, 65_536, 100_000])
+    func `Transport URLs reject ports outside the endpoint range`(port: Int) throws {
+        let url = try #require(URL(string: "ws://example.com:\(port)/socket"))
+
+        #expect(url.getParts() == nil)
+    }
+
+    @Test(arguments: ["wss", "WSS", "wSs", "https", "HTTPS", "HtTpS"])
+    func `Secure URL schemes are case insensitive`(scheme: String) throws {
+        let url = try #require(URL(string: "\(scheme)://example.com/socket"))
+
+        #expect(url.isTLSScheme)
+    }
+
     enum HandlerKind: String, CaseIterable, Sendable, CustomTestStringConvertible {
         case foundation
         case string

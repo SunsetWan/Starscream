@@ -256,6 +256,10 @@ Compression can expose secrets through compressed-size side channels when attack
 
 ## Resource limits
 
+Frame and message limits apply to data payloads. Control frames keep their RFC limit of 125 bytes, so small data limits still permit ping, pong, and close handling.
+
+While the server writes an opening response, it buffers at most one default maximum data frame plus 32 bytes of framing overhead. More input closes the transport and reports local error `1009`.
+
 The custom engine defaults to 16 MiB per frame and 64 MiB per reassembled or decompressed message. Oversized peer input closes the connection with code `1009`. Configure built-in framing and optional compression with one policy:
 
 ```swift
@@ -379,8 +383,10 @@ Starscream 5 is a major release because the package now builds in Swift 6 langua
 Applications with custom Starscream components also need these source changes:
 
 - Custom `Engine` implementations must conform to `Sendable`; completion handlers passed through engine and client write APIs are `@Sendable`.
+- Server and server-connection event closures are `@Sendable` and run on private serial queues. Use a task or dispatch queue to update UI state.
 - Custom `CertificatePinning` implementations must be `Sendable`, invoke an `@Sendable` completion, and handle `PinningState.failed` as an optional `Error`.
 - Custom `CompressionHandler` implementations must be reference types and `Sendable`. `load(headers:)` reports whether negotiation succeeded, `decompress(data:isFinal:)` throws on invalid input, and `reset()` clears connection-scoped state.
+- Asynchronous custom `Framer` implementations must implement `flush(completion:)` and deliver all queued frame events before calling its completion. The default implementation supports synchronous framers.
 - `WebSocket` is now a final, thread-safe facade. Put customization in an `Engine`, `Transport`, compression handler, certificate pinner, delegate, or event closure instead of subclassing it.
 
 The stricter contracts prevent unsynchronized user-defined components from weakening the concurrency guarantees of the built-in engines.

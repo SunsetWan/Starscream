@@ -118,6 +118,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
         var closeGeneration: UInt64 = 0
         var closeCode = CloseCode.normal.rawValue
         var receivedClose = false
+        var closeWritePending = false
+        var inputClosed = false
         var terminalEventDelivered = false
         var transportDelegate: TransportDelegateProxy?
         var httpDelegate: HTTPDelegateProxy?
@@ -278,13 +280,14 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 return
             }
             if opcode == .textFrame, String(data: data, encoding: .utf8) == nil {
+                let generation = self.state.attemptGeneration
                 let error = WSError(
                     type: .protocolError,
                     message: "text messages must contain valid UTF-8",
                     code: CloseCode.encoding.rawValue
                 )
                 completion?()
-                self.handleProtocolError(error, generation: self.state.attemptGeneration)
+                self.handleProtocolError(error, generation: generation)
                 return
             }
             self.sendFrame(data: data, opcode: opcode, allowCompression: true, completion: completion)
@@ -306,7 +309,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     }
 
     private func processConnectionState(_ connectionState: ConnectionState, generation: UInt64) {
-        guard isCurrentAttempt(generation) else { return }
+        guard isCurrentAttempt(generation), state.phase != .idle, state.phase != .closed else { return }
         switch connectionState {
         case .connected:
             guard state.phase == .connecting,
@@ -353,6 +356,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
             broadcast(.reconnectSuggested(status))
 
         case .receive(let data):
+            guard !state.inputClosed else { return }
             switch state.phase {
             case .connecting:
                 _ = httpHandler.parse(data: data)
@@ -370,12 +374,20 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
             deliverTerminal(.cancelled)
 
         case .peerClosed:
-            guard state.phase != .closed else { return }
-            state.phase = .closed
-            resetConnectionModules()
-            releaseAttemptDelegates()
-            deliverTerminal(.peerClosed)
+            framer.flush { [weak self] in
+                self?.performOnEventQueue { [weak self] in
+                    self?.finishInput(generation: generation)
+                }
+            }
         }
+    }
+
+    private func finishInput(generation: UInt64) {
+        guard isCurrentAttempt(generation), state.phase != .closed, state.phase != .idle else { return }
+        state.inputClosed = true
+        guard !state.closeWritePending else { return }
+        finishDisconnect(generation: generation)
+        deliverTerminal(.peerClosed)
     }
 
     // MARK: - HTTPHandlerDelegate
@@ -451,6 +463,7 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 }
             }
             broadcast(.connected(headers))
+            guard isCurrentAttempt(generation), state.phase == .open || state.phase == .closing else { return }
             if !leftover.isEmpty {
                 framer.add(data: leftover)
             }
@@ -548,6 +561,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
                 return
             }
             broadcast(.ping(data))
+            guard isCurrentAttempt(generation),
+                  state.phase == .open || (state.phase == .closing && !state.receivedClose) else { return }
             if state.respondToPingWithPong {
                 sendFrame(
                     data: data ?? Data(),
@@ -572,7 +587,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
         case .open:
             state.phase = .closing
             state.closeCode = code
+            state.closeWritePending = true
             deliverTerminal(.disconnected(reason, code))
+            guard isCurrentAttempt(generation), state.phase == .closing else { return }
             let payload = closePayload(code: code, reason: code == CloseCode.noStatusReceived.rawValue ? nil : reason)
             sendFrame(data: payload, opcode: .connectionClose, allowCompression: false) { [weak self] in
                 guard let self else { return }
@@ -584,7 +601,9 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
 
         case .closing:
             deliverTerminal(.disconnected(reason, code))
-            finishDisconnect(generation: generation)
+            if !state.closeWritePending {
+                finishDisconnect(generation: generation)
+            }
 
         case .idle, .connecting, .closed:
             break
@@ -595,8 +614,20 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
         guard isCurrentAttempt(generation), state.phase == .open else { return }
         state.phase = .closing
         state.closeCode = code
+        state.closeWritePending = true
         let payload = closePayload(code: code, reason: reason)
-        sendFrame(data: payload, opcode: .connectionClose, allowCompression: false, completion: nil)
+        sendFrame(data: payload, opcode: .connectionClose, allowCompression: false) { [weak self] in
+            guard let self else { return }
+            self.performOnEventQueue {
+                guard self.isCurrentAttempt(generation), self.state.phase == .closing else { return }
+                self.state.closeWritePending = false
+                if self.state.receivedClose {
+                    self.finishDisconnect(generation: generation)
+                } else if self.state.inputClosed {
+                    self.finishInput(generation: generation)
+                }
+            }
+        }
         scheduleCloseTimeout(generation: generation)
     }
 
@@ -675,19 +706,22 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
     private func failBeforeUpgrade(_ error: any Error, generation: UInt64) {
         guard isCurrentAttempt(generation), state.phase != .closed else { return }
         state.phase = .closed
-        broadcast(.error(error))
         resetConnectionModules()
         releaseAttemptDelegates()
         transport.disconnect()
+        broadcast(.error(error))
     }
 
     private func failConnection(_ error: any Error, generation: UInt64) {
         guard isCurrentAttempt(generation), state.phase != .closed else { return }
-        broadcast(.error(error))
+        let shouldReportError = !state.terminalEventDelivered
         state.phase = .closed
         resetConnectionModules()
         releaseAttemptDelegates()
         transport.disconnect()
+        if shouldReportError {
+            broadcast(.error(error))
+        }
     }
 
     private func finishDisconnect(generation: UInt64) {
@@ -714,6 +748,8 @@ FrameCollectorDelegate, HTTPHandlerDelegate, @unchecked Sendable {
         state.closeGeneration &+= 1
         state.offer = nil
         state.receivedClose = false
+        state.closeWritePending = false
+        state.inputClosed = false
         state.closeCode = CloseCode.normal.rawValue
         state.terminalEventDelivered = false
         resetConnectionModules()
